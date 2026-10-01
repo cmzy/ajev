@@ -9,8 +9,9 @@
     python scripts/colab_job.py stop    -s ajev
 
 Training runs detached (nohup) on the VM, so the local terminal can disconnect. With
-`--drive`, run directories live on Google Drive and survive a reclaimed VM; re-running
-`train` with the same --run resumes from the last checkpoint.
+`--drive`, run directories live on Google Drive and survive a reclaimed VM (if Drive
+mounting works for your account; otherwise `fetch --what last` periodically or pass
+`--hub-repo` to training). Re-running `train` with the same --run resumes from `last`.
 
 Note: code is sent to the VM as a file (`colab exec -f`); piping code on stdin hangs.
 """
@@ -90,6 +91,9 @@ def cmd_drive(a) -> None:
     colab("drivemount", "-s", a.session)
     remote_python(a.session, f"""
         import os
+        # drivemount can fail without a non-zero exit; never create the path on local disk by mistake.
+        if not os.path.ismount("/content/drive"):
+            raise SystemExit("Google Drive is NOT mounted; use local runs + `fetch`, or --hub-repo")
         os.makedirs("{DRIVE_RUNS}", exist_ok=True)
         print("drive runs dir:", "{DRIVE_RUNS}", os.listdir("{DRIVE_RUNS}"))
     """)
@@ -119,7 +123,9 @@ def cmd_status(a) -> None:
         print(subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
                               "--format=csv,noheader"], capture_output=True, text=True).stdout.strip())
         pid = open({out!r} + "/pid").read().strip() if os.path.exists({out!r} + "/pid") else None
-        alive = pid is not None and os.path.exists(f"/proc/{{pid}}")
+        stat = f"/proc/{{pid}}/stat"
+        # A crashed child stays a zombie ("Z") under the kernel process, so check the state too.
+        alive = pid is not None and os.path.exists(stat) and open(stat).read().split()[2] != "Z"
         print("pid", pid, "running" if alive else "NOT running")
         lines = open({out!r} + "/stdout.log").read().splitlines() if os.path.exists({out!r} + "/stdout.log") else []
         print("\\n".join(l[:300] for l in lines[-{a.lines}:]))

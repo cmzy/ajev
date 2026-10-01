@@ -85,18 +85,25 @@ def make_collate(pad_id: int):
     return fn
 
 
-def bucketed_order(lengths: list[int], batch_size: int, seed: int, mega: int = 64) -> list[int]:
-    """Shuffle, then sort inside mega-batches by length, then shuffle batch order."""
+def token_budget_batches(lengths: list[int], max_tokens: int, max_batch: int, seed: int,
+                         mega: int = 2048) -> list[list[int]]:
+    """Shuffle, sort by length inside mega-chunks, and cut batches whose padded size
+    (batch x longest sequence) stays within ``max_tokens``; then shuffle batch order."""
     rng = random.Random(seed)
     idx = list(range(len(lengths)))
     rng.shuffle(idx)
-    batches = []
-    span = batch_size * mega
-    for s in range(0, len(idx), span):
-        chunk = sorted(idx[s : s + span], key=lengths.__getitem__)
-        batches += [chunk[j : j + batch_size] for j in range(0, len(chunk), batch_size)]
+    batches: list[list[int]] = []
+    for s in range(0, len(idx), mega):
+        cur: list[int] = []
+        for i in sorted(idx[s : s + mega], key=lengths.__getitem__):
+            if cur and (len(cur) + 1 > max_batch or (len(cur) + 1) * lengths[i] > max_tokens):
+                batches.append(cur)
+                cur = []
+            cur.append(i)
+        if cur:
+            batches.append(cur)
     rng.shuffle(batches)
-    return [i for b in batches for i in b]
+    return batches
 
 
 def evaluate(model, encoder, decisions, device, batch_size) -> dict:
@@ -118,8 +125,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="jhu-clsp/mmBERT-base")
     ap.add_argument("--max-len", type=int, default=1024)
-    ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--grad-accum", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=32, help="max decisions per micro-batch")
+    ap.add_argument("--max-tokens", type=int, default=8192,
+                    help="max padded tokens per micro-batch and view (two views are run per step)")
+    ap.add_argument("--grad-accum", type=int, default=2)
     ap.add_argument("--epochs", type=float, default=3)
     ap.add_argument("--max-steps", type=int, default=0, help="optimizer steps; overrides --epochs when > 0")
     ap.add_argument("--lr", type=float, default=3e-5, help="backbone learning rate")
@@ -161,7 +170,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.val_limit:
         vals = {k: random.Random(args.seed).sample(v, min(args.val_limit, len(v))) for k, v in vals.items()}
 
-    steps_per_epoch = math.ceil(len(train) / (args.batch_size * args.grad_accum))
+    print(f"[train] tokenizing {len(train)} decisions for length bucketing", flush=True)
+    lengths = [len(encoder.encode(d).input_ids) for d in train]
+
+    def epoch_batches(epoch: int) -> list[list[int]]:
+        return token_budget_batches(lengths, args.max_tokens, args.batch_size, seed=args.seed * 1000 + epoch)
+
+    steps_per_epoch = math.ceil(len(epoch_batches(0)) / args.grad_accum)
     total_steps = args.max_steps or int(steps_per_epoch * args.epochs)
     head_params = list(model.head.parameters())
     body_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -181,13 +196,14 @@ def main(argv: list[str] | None = None) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16) if hasattr(torch.amp, "GradScaler") \
         else torch.cuda.amp.GradScaler(enabled=amp_dtype == torch.float16)
 
-    step, micro_total, best = 0, 0, -1.0
+    step, micro_total, epoch, epoch_micro, best = 0, 0, 0, 0, -1.0
     if resume:
         st = torch.load(os.path.join(last_dir, STATE_FILE), map_location="cpu", weights_only=False)
         optim.load_state_dict(st["optim"])
         sched.load_state_dict(st["sched"])
         scaler.load_state_dict(st["scaler"])
         step, micro_total, best = st["step"], st["micro_total"], st["best"]
+        epoch, epoch_micro = st["epoch"], st["epoch_micro"]
         print(f"[train] resumed from {last_dir} at step {step}", flush=True)
 
     os.makedirs(args.out, exist_ok=True)
@@ -212,7 +228,8 @@ def main(argv: list[str] | None = None) -> None:
         model.save(path, tokenizer, extra={"encoding": encoding_cfg, "base_model": args.model, "step": step})
         if with_state:
             torch.save({"optim": optim.state_dict(), "sched": sched.state_dict(), "scaler": scaler.state_dict(),
-                        "step": step, "micro_total": micro_total, "best": best}, os.path.join(path, STATE_FILE))
+                        "step": step, "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro,
+                        "best": best}, os.path.join(path, STATE_FILE))
         if hub:
             hub.upload_folder(repo_id=args.hub_repo, folder_path=path, path_in_repo=os.path.basename(path),
                               run_as_future=True)
@@ -234,18 +251,13 @@ def main(argv: list[str] | None = None) -> None:
             log({"new_best": round(best, 4)})
 
     trainset = TrainSet(train, encoder, args.seed)
-    lengths = [len(d.state) + len(d.instructions) + sum(len(o.name) + len(o.desc) for o in d.options) for d in train]
     collate_fn = make_collate(tokenizer.pad_token_id)
-    micro_per_epoch = math.ceil(len(train) / args.batch_size)
 
     model.train()
     t0, running = time.time(), {"loss": 0.0, "ce": 0.0, "rps": 0.0, "cons": 0.0, "n": 0}
     while step < total_steps:
-        epoch, skip = divmod(micro_total, micro_per_epoch)
         trainset.epoch = epoch
-        order = bucketed_order(lengths, args.batch_size, seed=args.seed * 1000 + epoch)
-        order = order[skip * args.batch_size :]  # resume mid-epoch deterministically
-        batches = [order[i : i + args.batch_size] for i in range(0, len(order), args.batch_size)]
+        batches = epoch_batches(epoch)[epoch_micro:]  # resume mid-epoch deterministically
         loader = DataLoader(trainset, batch_sampler=batches, collate_fn=collate_fn,
                             num_workers=args.num_workers, persistent_workers=False)
         for batch in loader:
@@ -275,6 +287,7 @@ def main(argv: list[str] | None = None) -> None:
             running["cons"] += cons.mean().item()
             running["n"] += 1
             micro_total += 1
+            epoch_micro += 1
             if micro_total % args.grad_accum:
                 continue
             scaler.unscale_(optim)
@@ -298,6 +311,8 @@ def main(argv: list[str] | None = None) -> None:
                 save(last_dir, with_state=True)
             if step >= total_steps:
                 break
+        else:
+            epoch, epoch_micro = epoch + 1, 0
 
     if step % args.eval_every:
         run_eval()
