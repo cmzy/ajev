@@ -147,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-typed-decisions", action="store_true")
     ap.add_argument("--typed-val-frac", type=float, default=0.1,
                     help="fraction of typed-decisions train states held out as val_typed")
+    ap.add_argument("--typed-repeat", type=int, default=1,
+                    help="put each typed-decisions train decision into train this many times (upweighting)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
@@ -224,13 +226,27 @@ def main(argv: list[str] | None = None) -> None:
             clean.append(d)
     train = clean
 
+    # ---- 第 4.5 步：提高 typed-decisions 的比重 ----
+    # 训练集扩充到 20 万道题后，typed-decisions（主测试集的同类题）只占 2.7%，被大量其他数据“稀释”了，
+    # 客服、发票这两个流程的成绩随之下降。最简单的加权办法是把它的训练题多放几份：
+    # --typed-repeat 3 就是每道题出现 3 次，占比回到约 7–8%。
+    # 必须放在去重之后做，否则复制出来的题会被当成重复题删掉。副本的 id 加上 "#r1"、"#r2" 后缀，保证唯一；
+    # 训练时每份副本的选项会被随机打乱成不同的顺序，所以模型看到的并不是一模一样的三道题。
+    if args.typed_repeat > 1:
+        typed = [d for d in train if d.source.startswith("typed_decisions/")]
+        for r in range(1, args.typed_repeat):
+            train += [Decision(**{**d.__dict__, "id": f"{d.id}#r{r}"}) for d in typed]
+
     # ---- 第 5 步：打乱 ----
     # 很多数据源的正确答案总在固定位置（例如候选列表里 gold 的位置、NLI 选项的固定顺序），
     # 这里对 choice / noul 题统一打乱一次选项顺序（score 题的等级有序，不打乱）；
     # 训练时还会再做实时的随机打乱。typed-decisions 的测试 / 验证集保持原始顺序，与官方评测一致。
     train = [d.shuffled(rng) for d in train]
-    val = [d.shuffled(rng) for d in val]
-    test_public = [d.shuffled(rng) for d in test_public]
+    # 评测文件用单独的随机数生成器：这样改动训练集（比如 --typed-repeat、增减训练上限）
+    # 不会连带改变验证 / 测试集的选项顺序，不同版本的评测结果才能直接比较。
+    eval_rng = random.Random(f"eval/{args.seed}")
+    val = [d.shuffled(eval_rng) for d in val]
+    test_public = [d.shuffled(eval_rng) for d in test_public]
     # 打乱训练集整体顺序，避免同一数据源的题聚在一起。
     rng.shuffle(train)
 
