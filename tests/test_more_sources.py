@@ -114,3 +114,43 @@ def test_ultrafeedback_zh_score():
     d.validate()
     assert d.gold_index == 3 and d.lang == "zh"
     assert d.instructions == ms.UF_ASPECTS["helpfulness"][0]
+
+
+def test_clip_keeps_head_and_tail():
+    """_clip 保留开头约 70% 和结尾约 30%，中间用“…”省略，总长度正好等于上限；不超长的文本原样返回。"""
+    assert ms._clip("abcdefghijklmnopqrstuvwxyz", 10) == "abcdefg…yz"
+    assert ms._clip("short", 10) == "short"
+
+
+def test_helpsteer3_state_puts_key_parts_first():
+    """HelpSteer3 的材料：用户最后一句话和两个回复放在最前面，早期对话放最后且只留 4 条，长回复被截短。"""
+    context = [{"role": "user" if k % 2 == 0 else "assistant", "content": f"turn {k}"} for k in range(9)]
+    row = {"context": context, "response1": "x" * 5000, "response2": "y", "overall_preference": 1,
+           "language": "english", "individual_preference": []}
+    d = ms.conv_helpsteer3(row, 0, ctx("helpsteer3"))
+    s = json.loads(d.state)
+    assert list(s) == ["last_user_turn", "response_1", "response_2", "earlier_conversation"]
+    assert s["last_user_turn"] == "turn 8"
+    assert len(s["response_1"]) == 1200 and s["response_2"] == "y"
+    assert [m["content"] for m in s["earlier_conversation"]] == ["turn 4", "turn 5", "turn 6", "turn 7"]
+
+
+def test_shuffled_holdout_split(monkeypatch):
+    """"#train" / "#eval" 先用固定种子打乱再切分：两部分不重叠、合起来是全部数据，而且标签分布接近。
+
+    模拟 When2Call 的情况：100 行数据按标签排好序（前 70 行是 a，后 30 行是 b）。
+    如果按原顺序取后 15%，评测部分会全是 b；打乱后切分，评测部分应该两种标签都有。
+    """
+    from datasets import Dataset
+
+    from ajev.data import sources
+
+    data = Dataset.from_dict({"x": list(range(100)), "y": ["a"] * 70 + ["b"] * 30})
+    monkeypatch.setattr("datasets.load_dataset", lambda *a, **k: data)
+    src = sources.Source("toy", "toy/path", None, "train#train", "train#eval", "en", lambda r, i, c: None,
+                         holdout=0.15)
+    tr, ev = src.load("train#train"), src.load("train#eval")
+    assert len(ev) == 15 and len(tr) == 85
+    assert set(tr["x"]) | set(ev["x"]) == set(range(100)) and not set(tr["x"]) & set(ev["x"])
+    assert set(ev["y"]) == {"a", "b"}
+    assert src.load("train#eval")["x"] == ev["x"]  # 固定种子：每次切分结果一样

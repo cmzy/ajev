@@ -151,8 +151,13 @@ class Source:
         train_cap: 本数据源的训练采样上限；None 表示用 build.py 的全局 ``--train-cap``。
             大数据源（如 bev-decision）想多采一些、小数据源想少采一些时用它。
 
-    split 名也可以写成“切片”形式，例如 ``"train[:90%]"`` / ``"train[90%:]"``：
-    有些数据集只有 train 一个 split，就用前 90% 训练、后 10% 做验证 / 测试。
+    有些数据集只有一个 split，需要自己切出训练和评测两部分。这时 split 写成 ``"<原 split>#train"`` /
+    ``"<原 split>#eval"``，并用 ``holdout`` 指定评测部分占的比例（例如 0.1）。
+    切分前会用**固定种子**整体打乱，所以两部分的分布一致，而且每次构建结果都一样。
+
+    为什么不用 ``"train[:90%]"`` / ``"train[90%:]"`` 这种切片：切片是按原始顺序取的，
+    而很多数据集是排好序的。例如 When2Call 的 mcq 按答案类型排序，后 15% 全是 tool_call，
+    用它做评测得到的准确率毫无意义（我们第一次就踩了这个坑：When2Call 只有 0.34）。
     """
 
     name: str
@@ -167,16 +172,29 @@ class Source:
     tags: list[str] = field(default_factory=list)
     data_files: dict[str, str] | None = None
     train_cap: int | None = None
+    holdout: float = 0.1
 
     def load(self, split: str):
         """从 HF Hub（或本地缓存）加载指定 split。``datasets`` 延迟导入，避免只用 schema 时也要装它。"""
         from datasets import load_dataset
 
+        base, _, part = split.partition("#")
         if self.data_files:
             # 按文件加载：split 名是 data_files 的键；只加载这一个文件，避免列不一致的报错。
-            base = split.split("[")[0]
-            return load_dataset(self.path, data_files={base: self.data_files[base]}, split=split)
-        return load_dataset(self.path, self.config, split=split)
+            key = base.split("[")[0]
+            ds = load_dataset(self.path, data_files={key: self.data_files[key]}, split=base)
+        else:
+            ds = load_dataset(self.path, self.config, split=base)
+        if not part:
+            return ds
+        # "#train" / "#eval"：用固定种子打乱后切分（种子与 build 的 --seed 无关，保证训练和评测永远不重叠）。
+        ds = ds.shuffle(seed=12345)
+        n_eval = int(len(ds) * self.holdout)
+        if part == "eval":
+            return ds.select(range(n_eval))
+        if part == "train":
+            return ds.select(range(n_eval, len(ds)))
+        raise ValueError(f"unknown split part {part!r} in {split!r}")
 
     def iter_decisions(
         self, split: str, limit: int | None, seed: int, zh_instr_prob: float = 0.0

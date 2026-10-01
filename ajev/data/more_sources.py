@@ -30,8 +30,9 @@
    target 就是 “+1 级 2/3、+2 级 1/3”，而不是只取平均或多数票。这样模型学到的是
    “这道题本身就有争议”，概率更诚实。
 
-4. **只有 train 一个 split 的数据集**，用切片写法 ``"train[:90%]"`` 训练、``"train[90%:]"`` 做验证 / 测试，
-   两部分不重叠。
+4. **只有一个 split 的数据集**，写成 ``"train#train"`` / ``"train#eval"``：先用固定种子打乱，
+   再切出训练和评测两部分（比例由 ``holdout`` 指定），两部分不重叠、分布一致。
+   不能直接按原始顺序切（例如 ``"train[90%:]"``），因为很多数据集是排好序的，详见 sources.py 的 Source 说明。
 """
 
 from __future__ import annotations
@@ -210,8 +211,8 @@ def conv_feedback(row: Row, i: int, ctx: Ctx) -> Decision | None:
 
 T_PREF = {
     "en": ["Which response is better for the conversation, and by how much?",
-           "Compare `response_1` and `response_2`: which one better answers the last user turn?"],
-    "zh": ["对这段对话来说，哪个回复更好？好多少？", "比较 `response_1` 和 `response_2`：哪个更好地回应了用户最后一句话？"],
+           "Compare `response_1` and `response_2`: which one better answers `last_user_turn`?"],
+    "zh": ["对这段对话来说，哪个回复更好？好多少？", "比较 `response_1` 和 `response_2`：哪个更好地回应了 `last_user_turn`？"],
 }
 PREF_LEVELS = {
     "en": ["Response 1 is much better than Response 2.", "Response 1 is better than Response 2.",
@@ -223,6 +224,22 @@ PREF_LEVELS = {
 }
 
 
+# 中日韩文字大约 1 个字就是 1 个 token，英文大约 4 个字符 1 个 token，所以按语言给不同的字符预算。
+CJK_LANGS = {"chinese", "japanese", "korean"}
+
+
+def _clip(text: str, limit: int) -> str:
+    """把过长的文本截到 ``limit`` 个字符以内：保留开头约 70% 和结尾约 30%，中间用“…”省略。
+
+    为什么保留结尾：回复的结论、代码的最后部分、对话最后的要求往往在末尾，只保留开头会丢掉这些。
+    例如 limit=10，"abcdefghijklmnopqrstuvwxyz" → "abcdefg…yz"（开头 7 个 + “…” 1 个 + 结尾 2 个 = 正好 10 个）。
+    """
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    return text[:head] + "…" + text[len(text) - (limit - head - 1):]
+
+
 def conv_helpsteer3(row: Row, i: int, ctx: Ctx) -> Decision | None:
     """一段对话 + 两个候选回复 → 一道 7 级打分题（哪个更好、好多少），target 是标注者意见的分布。
 
@@ -231,6 +248,15 @@ def conv_helpsteer3(row: Row, i: int, ctx: Ctx) -> Decision | None:
         → 第 2 级（-1）有 2 票，第 1 级（-2）有 1 票 → target = [0, 1/3, 2/3, 0, 0, 0, 0]。
     没有逐人分数时退回到总分 overall_preference 的 one-hot。
     数据中 language="chinese" 的部分是中文对话，标记为 zh。
+
+    材料（state）的构造——为什么不能直接把整段对话和两个回复按原样放进去：
+        HelpSteer3 的材料很长，中位数约 1,260 个 token，而我们的序列上限是 1,024。编码器超长时
+        从材料的**尾部**截断，原先的顺序是“对话 → 回复 1 → 回复 2”，结果 67% 的题被截断，
+        截掉的恰恰是最关键的两个回复（第一版的 HelpSteer3 准确率只有 0.26，原因就在这里）。
+    现在的做法：
+        第 1 步：最重要的放最前面：用户最后一句话、回复 1、回复 2，每段按字符预算截短（保留首尾）；
+        第 2 步：更早的对话只保留最后 4 条消息，每条也截短，放在最后。
+        这样即使超长，被截掉的也只是最不重要的早期对话。
     """
     votes = Counter(int(p["score"]) + 3 for p in (row.get("individual_preference") or [])
                     if p.get("score") is not None and -3 <= int(p["score"]) <= 3)
@@ -242,8 +268,21 @@ def conv_helpsteer3(row: Row, i: int, ctx: Ctx) -> Decision | None:
         return None
     is_zh = row.get("language") == "chinese"
     lang = "zh" if is_zh else ctx.instr_lang()
-    state = state_to_text({"conversation": row["context"], "response_1": row["response1"],
-                           "response_2": row["response2"]})
+    # 字符预算：问题 + 两个回复合计约 700 个 token，给题型提示、问题和 7 个选项描述留出空间。
+    cjk = row.get("language") in CJK_LANGS
+    user_limit, resp_limit, turn_limit = (250, 450, 150) if cjk else (800, 1200, 400)
+    context = row.get("context") or []
+    # 第 1 步：找出用户的最后一句话（对话最后一条一般就是用户发言）。
+    last_user = next((m["content"] for m in reversed(context) if m.get("role") == "user"), "")
+    earlier = context[:-1] if context and context[-1].get("role") == "user" else context
+    state = state_to_text({
+        "last_user_turn": _clip(last_user, user_limit),
+        "response_1": _clip(row["response1"], resp_limit),
+        "response_2": _clip(row["response2"], resp_limit),
+        # 第 2 步：更早的对话放最后，只留最后 4 条。
+        "earlier_conversation": [{"role": m.get("role"), "content": _clip(m.get("content") or "", turn_limit)}
+                                 for m in earlier[-4:]],
+    })
     d = _score(ctx, i, state, ctx.pick(T_PREF, lang), PREF_LEVELS[lang], target)
     d.lang = "zh" if is_zh else "en"
     return d
@@ -427,26 +466,27 @@ MORE_SOURCES: dict[str, Source] = {
         Source("bev_numeric", "avbiswas/bev-decision", "numeric_temporal", "train", "test", "en", conv_bev,
                train_cap=5000),
         Source("bev_skills", "avbiswas/bev-decision", "skills", "train", "test", "en", conv_bev, train_cap=8000),
-        # 客服工单：只有 train，用前 90% 训练、后 10% 评测。label_field="queue" 用来收集全部队列名。
-        Source("support_tickets", "Tobi-Bueck/customer-support-tickets", None, "train[:90%]", "train[90%:]", "en",
+        # 客服工单：只有 train，打乱后 90% 训练、10% 评测。label_field="queue" 用来收集全部队列名。
+        Source("support_tickets", "Tobi-Bueck/customer-support-tickets", None, "train#train", "train#eval", "en",
                conv_ticket, label_field="queue", train_cap=9000),
-        Source("feedback_collection", "prometheus-eval/Feedback-Collection", None, "train[:95%]", "train[95%:]", "en",
+        Source("feedback_collection", "prometheus-eval/Feedback-Collection", None, "train#train", "train#eval", "en",
                conv_feedback, train_cap=5000),
         Source("helpsteer3", "nvidia/HelpSteer3", "preference", "train", "validation", "en", conv_helpsteer3,
                train_cap=5000),
         Source("pku_saferlhf", "PKU-Alignment/PKU-SafeRLHF", "default", "train", "test", "en", conv_pku,
                train_cap=6000),
         # When2Call 的训练集只有对话、没有显式标签，所以用带 correct_answer 的 test/mcq，
-        # 前 85% 训练、后 15% 评测（我们不拿 When2Call 当正式基准，所以可以这样用）。
-        Source("when2call", "nvidia/When2Call", "test", "mcq[:85%]", "mcq[85%:]", "en", conv_when2call,
-               train_cap=4000),
+        # 打乱后 85% 训练、15% 评测（我们不拿 When2Call 当正式基准，所以可以这样用）。
+        # 注意 mcq 是按答案类型排序的，必须打乱再切，否则评测部分全是 tool_call。
+        Source("when2call", "nvidia/When2Call", "test", "mcq#train", "mcq#eval", "en", conv_when2call,
+               train_cap=4000, holdout=0.15),
         Source("wanli", "alisawuffles/WANLI", None, "train", "test", "en", conv_wanli),
         Source("toxicn", "JunyuLu/ToxiCN", None, "train", "test", "zh", conv_toxicn),
         # COLD 的 test.csv 比其他文件多一列，整体加载会报错，所以按文件加载，用 dev.csv 做评测。
         Source("cold", "thu-coai/cold", None, "train", "dev", "zh", conv_cold,
                data_files={"train": "train.csv", "dev": "dev.csv"}),
         # 仓库里另有两个“二值化”衍生文件，只读主文件，避免混在一起加载。
-        Source("ultrafeedback_zh", "opencsg/UltraFeedback-chinese", None, "train[:95%]", "train[95%:]", "zh",
+        Source("ultrafeedback_zh", "opencsg/UltraFeedback-chinese", None, "train#train", "train#eval", "zh",
                conv_uf_zh, train_cap=4000, data_files={"train": "ultrafeedback_zh.parquet"}),
     ]
 }
