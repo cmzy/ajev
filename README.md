@@ -68,6 +68,41 @@ uv run python -m ajev.eval.evaluate --data data/build/test_typed.jsonl --predict
 | 系统 | 准确率 |
 |---|---|
 | 按训练集答案频率猜（本仓库基线） | 0.479 |
+| AJev sft2（第一版数据，8.6 万题） | 0.7185 |
+| AJev sft3（第二版数据，20 万题） | 0.7260 |
+| **AJev sft4**（修复数据问题 + typed-decisions 训练题 ×3） | **0.7745** |
 | TypeSafe Jev | 0.727 |
 | Laya（421M） | 0.766 |
 | Verdict 2.0（151M） | 0.771 |
+
+## 部署到 MacBook（Apple 芯片，如 M4）
+
+模型约 1.2 GB（3 亿参数，fp32），推理自动使用 Apple 芯片的 GPU（MPS）。
+
+```bash
+git clone git@github.com:cmzy/ajev.git && cd ajev
+uv venv --python 3.12 && source .venv/bin/activate
+# transformers 必须与训练环境一致（Colab 上是 5.16.1）：旧版 4.x 加载同一个模型，结果会明显不同
+uv pip install -e ".[train,serve]" "transformers==5.16.1"
+
+# 把训练好的模型目录拷到 runs/sft4/best（scp / AirDrop / U 盘）
+# 一致性检查：本机预测与训练环境保存的预测逐题比较，通过才上线
+python scripts/verify_deploy.py --checkpoint runs/sft4/best \
+    --data data/build4/test_typed.jsonl --reference runs/sft4/preds_test_typed.jsonl --limit 200
+
+# 启动服务（Jev 兼容接口）
+python -m ajev.server --checkpoint runs/sft4/best --port 8000
+curl localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": {"ticket": "我的订单三天了还没发货"},
+  "questions": {
+    "category": {"type": "choice", "instructions": "这是什么问题？",
+                 "criteria": {"delivery": "物流配送", "refund": "退款", "account": "账户"}},
+    "urgent": {"type": "noul", "instructions": "需要马上人工处理。"}
+  }
+}'
+```
+
+一致性检查需要的 `data/build4/test_typed.jsonl` 和 `runs/sft4/preds_test_typed.jsonl` 不在 git 里，要和模型一起拷过去
+（也可以用 `python -m ajev.data.build --out data/build4 --typed-repeat 3` 重新生成数据）。
+实测参考：transformers 5.17 + CPU fp32 与 A100 bf16 的预测相比，概率最大差 0.008，最高票答案一致 98.5%
+（不一致的都是前两名几乎打平的题）。
