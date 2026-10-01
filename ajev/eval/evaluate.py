@@ -156,6 +156,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint", help="model directory (needed by --predictor model)")
     ap.add_argument("--lm-model", help="HF id or path of a chat LLM (needed by --predictor lm), "
                                        "e.g. google/gemma-4-12B-it")
+    ap.add_argument("--lm-adapter", help="LoRA adapter directory for --predictor lm (default: zero-shot)")
     ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
@@ -185,7 +186,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit("--predictor lm needs --lm-model")
             from ajev.lm.predictor import LMPredictor
 
-            predictor = LMPredictor(args.lm_model)
+            predictor = LMPredictor(args.lm_model, adapter=args.lm_adapter)
         else:
             predictor = UniformPredictor() if args.predictor == "uniform" else RandomPredictor()
         preds = predictor.predict(decisions)

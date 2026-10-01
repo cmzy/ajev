@@ -121,7 +121,7 @@ STATE_FILE = "trainer_state.pt"
 META_FILE = "trainer_meta.json"
 
 
-def checkpoint_step(path: str) -> int | None:
+def checkpoint_step(path: str, needed: list[str] | None = None) -> int | None:
     """检查一个可续训的 checkpoint 目录是否完整；完整则返回它的步数，否则返回 None。
 
     为什么需要：Colab 的 VM 可能在任意时刻被回收。如果恰好在写 checkpoint 时被打断，
@@ -136,10 +136,15 @@ def checkpoint_step(path: str) -> int | None:
        这样只需读几个小文件，不必把约 1 GB 的训练状态整个读一遍；
     3. 没有清单时（旧版本保存的 checkpoint）：退回到完整读取 trainer_state.pt
        （文件被截断时 torch.load 会抛异常），并核对其中的 step 与配置一致。
+
+    ``needed`` 指定必须存在的文件，默认是 mmBERT checkpoint 的四个文件；大模型 LoRA 训练（ajev/lm/train.py）
+    传入它自己的文件列表，复用同一套检查。配置文件（第一个以 config.json 结尾的文件）里要有 step。
     """
     from ajev.model.encoder import AJEV_CONFIG, HEAD_FILE
 
-    needed = ["model.safetensors", HEAD_FILE, AJEV_CONFIG, STATE_FILE]
+    if needed is None:
+        needed = ["model.safetensors", HEAD_FILE, AJEV_CONFIG, STATE_FILE]
+    cfg_file = next(f for f in needed if f.endswith("config.json"))
     if not all(os.path.exists(os.path.join(path, f)) for f in needed):
         return None
     meta_path = os.path.join(path, META_FILE)
@@ -147,7 +152,7 @@ def checkpoint_step(path: str) -> int | None:
         try:
             with open(meta_path) as f:
                 meta = json.load(f)
-            with open(os.path.join(path, AJEV_CONFIG)) as f:
+            with open(os.path.join(path, cfg_file)) as f:
                 cfg_step = json.load(f).get("step")
         except Exception:
             return None
@@ -155,20 +160,20 @@ def checkpoint_step(path: str) -> int | None:
         return meta["step"] if sizes_ok and meta["step"] == cfg_step else None
     try:
         st = torch.load(os.path.join(path, STATE_FILE), map_location="cpu", weights_only=False)
-        with open(os.path.join(path, AJEV_CONFIG)) as f:
+        with open(os.path.join(path, cfg_file)) as f:
             cfg_step = json.load(f).get("step")
     except Exception:  # 文件被截断 / 损坏
         return None
     return st["step"] if st.get("step") == cfg_step else None
 
 
-def find_resumable(last_dir: str) -> str | None:
+def find_resumable(last_dir: str, needed: list[str] | None = None) -> str | None:
     """在 ``last`` 和它的备份 ``last.prev`` 中，找出最新的完整 checkpoint。
 
     返回可用的目录；两个都不存在时返回 None（表示从头训练）；
     目录存在但都不完整时直接报错退出，避免悄悄从头开始、浪费已有进度。
     """
-    candidates = [(checkpoint_step(p), p) for p in (last_dir, last_dir + ".prev") if os.path.isdir(p)]
+    candidates = [(checkpoint_step(p, needed), p) for p in (last_dir, last_dir + ".prev") if os.path.isdir(p)]
     if not candidates:
         return None
     valid = [(s, p) for s, p in candidates if s is not None]

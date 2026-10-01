@@ -177,7 +177,9 @@ def main(argv: list[str] | None = None) -> None:
     from ajev.model.predictor import EncoderPredictor, softmax
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--checkpoint", help="mmBERT checkpoint directory")
+    ap.add_argument("--lm-model", help="base LLM for the LLM route, e.g. google/gemma-4-12B-it")
+    ap.add_argument("--lm-adapter", help="LoRA adapter directory (temperatures are written into it)")
     ap.add_argument("--data", nargs="+", required=True)  # nargs="+"：可以接收一个或多个文件路径
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--report-frac", type=float, default=0.3,
@@ -188,7 +190,18 @@ def main(argv: list[str] | None = None) -> None:
     # 第 1 步：把所有验证文件里的题合并成一个列表（嵌套列表推导式：先遍历文件，再遍历文件里的题）。
     decisions = [d for p in args.data for d in read_jsonl(p)]
     # 第 2 步：temperatures={} 表示强制不使用 checkpoint 里已有的温度，这样拿到的是原始 logits。
-    pred = EncoderPredictor(args.checkpoint, batch_size=args.batch_size, temperatures={})
+    if args.lm_adapter:
+        # 大模型路线：温度写进 LoRA 适配器目录的 ajev_lm_config.json。
+        from ajev.lm.predictor import LM_CONFIG, LMPredictor, read_lm_config
+
+        pred = LMPredictor(args.lm_model or read_lm_config(args.lm_adapter)["base_model"], adapter=args.lm_adapter,
+                           temperatures={})
+        target_dir, config_name = args.lm_adapter, LM_CONFIG
+    elif args.checkpoint:
+        pred = EncoderPredictor(args.checkpoint, batch_size=args.batch_size, temperatures={})
+        target_dir, config_name = args.checkpoint, AJEV_CONFIG
+    else:
+        raise SystemExit("need --checkpoint (mmBERT) or --lm-adapter (LLM)")
     logits = pred.predict_logits(decisions)
     # 第 3 步：随机打乱下标后切成“拟合部分”和“留出部分”，用拟合部分的温度在留出部分上评估。
     idx = list(range(len(decisions)))
@@ -210,7 +223,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"final temperatures (fitted on all {len(decisions)} decisions): {temps}")
 
     # 第 5 步：在原有配置（编码参数、基座模型名等）的基础上，只更新 temperatures 字段，不覆盖其他内容。
-    path = os.path.join(args.checkpoint, AJEV_CONFIG)  # os.path.join 按操作系统规则拼接路径
+    path = os.path.join(target_dir, config_name)  # os.path.join 按操作系统规则拼接路径
     cfg = json.load(open(path)) if os.path.exists(path) else {}
     cfg["temperatures"] = temps
     # 记下温度是在哪一步的权重上拟合的（训练保存 checkpoint 时会写入 step）。
