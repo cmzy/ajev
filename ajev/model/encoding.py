@@ -49,7 +49,9 @@
 
 长度预算（单位：token）：
 - instructions（问题）最多 ``max_instr`` 个 token；
-- 选项区最多 ``max_options`` 个 token（选项太长时先压缩每个选项的描述）；
+- 选项区通常最多 ``max_options`` 个 token（选项太长时先压缩每个选项的描述）；选项特别多、
+  光选项名就超出时，预算会放宽到“max_len 除去头部后的剩余空间”；
+- 无论如何，整条序列都不会超过 ``max_len``；
 - state 用剩下的全部长度，直到 ``max_len``。
 为什么要限制长度：Transformer 的计算量和显存大约随序列长度的平方增长，长度必须有上限。
 
@@ -100,7 +102,9 @@ class DecisionEncoder:
             （mmBERT 中 cls 就是 <bos>，sep 就是 <eos>，不同模型叫法不同但作用一样）。
         max_len: 整条序列的最大 token 数（T4 上默认 1024；实测只有约 0.3% 的题会超过）。
         max_instr: 问题（instructions）的最大 token 数，超出部分直接截掉。
-        max_options: 选项区（所有标记位 + 选项名 + 描述）的 token 预算。
+        max_options: 选项区（所有标记位 + 选项名 + 描述）的常规 token 预算。选项特别多、
+            光选项名就超过这个预算时，会自动扩大到“整条序列除去头部后还剩的空间”，
+            只有连这都放不下才报错（见 ``_options``）。
         min_desc: 压缩描述时，每个选项描述至少保留的 token 数；如果预算连这么多都给不了，
             干脆全部去掉描述只保留选项名（只剩半句的描述往往比没有描述更容易误导模型）。
 
@@ -126,6 +130,10 @@ class DecisionEncoder:
         # 缺任何一个特殊 token 都没法按约定格式编码，尽早报错比训练到一半才发现好。
         if None in (self.bos, self.eos, self.marker):
             raise ValueError("tokenizer needs cls/bos, sep/eos and mask tokens")
+        # 头部最长 = 1(<bos>) + 8(题型提示) + max_instr + 1(<eos>)，后面还要放选项和 2 个 <eos>。
+        # max_len 太小时连头部都放不下，序列必然超长，所以在这里就拒绝这种配置。
+        if max_len < max_instr + 32:
+            raise ValueError(f"max_len={max_len} is too small for max_instr={max_instr}")
 
     def _ids(self, text: str) -> list[int]:
         """把一段文本切成 token id（不加任何特殊 token）；空文本返回空列表。
@@ -136,13 +144,22 @@ class DecisionEncoder:
         """
         return self.tok(text, add_special_tokens=False)["input_ids"] if text else []
 
-    def _options(self, d: Decision) -> list[list[int]]:
+    def _options(self, d: Decision, limit: int) -> list[list[int]]:
         """为每个选项生成 ``[<mask>] + 选项名 + ": 描述"`` 的 token 片段，并保证总长不超预算。
 
+        Args:
+            d: 要编码的题。
+            limit: 选项区绝对不能超过的长度，也就是整条序列去掉头部和 2 个 <eos> 后剩下的空间。
+                由 ``encode`` 计算并传入，保证最终序列长度 ≤ max_len。
+
         策略：
-        1. 先只算“标记位 + 选项名”的长度（names_only）。如果连这都超过 max_options，
-           说明选项太多，直接报错（以后可改为分组读取）。
-        2. 否则用二分查找求出“每个选项描述最多能保留多少 token”（所有描述共用同一个上限 cap），
+        1. 先只算“标记位 + 选项名”的长度（names_only），确定本题的预算 budget：
+           - 通常 budget = max_options；
+           - Jev 允许最多 255 个选项，选项很多时光选项名就可能超过 max_options。这时把预算
+             扩大到 names_only（材料的空间相应变少），而不是直接报错让整个训练或推理中断；
+           - 但 budget 永远不超过 limit。如果连 limit 都放不下所有选项名，说明这道题在 max_len 内
+             根本编码不了，才报错（训练时会跳过这类题，见 train.py）。
+        2. 再用二分查找求出“每个选项描述最多能保留多少 token”（所有描述共用同一个上限 cap），
            使总长度刚好不超预算。
         3. 若求出的上限小于 min_desc（且不是因为描述本来就短），就把描述全部去掉。
 
@@ -163,9 +180,12 @@ class DecisionEncoder:
         descs = [self._ids(f": {o.desc}") if o.desc else [] for o in d.options]
         # 每个选项至少占 1（标记位）+ 选项名长度。
         names_only = sum(1 + len(n) for n in names)
-        if names_only > self.max_options:
+        # 本题的选项预算：至少 max_options，选项名本身更长时放宽到 names_only，但不能超过 limit。
+        budget = min(max(self.max_options, names_only), limit)
+        if names_only > budget:
             raise ValueError(
-                f"{d.id}: {len(d.options)} option names need {names_only} tokens > max_options={self.max_options}"
+                f"{d.id}: {len(d.options)} option names need {names_only} tokens > {limit} available "
+                f"(max_len={self.max_len})"
             )
         # 二分查找：在预算内，每个选项描述可以保留的最大 token 数。
         # 搜索区间是 [0, longest]：0 表示不要描述，longest 表示所有描述都完整保留。
@@ -174,7 +194,7 @@ class DecisionEncoder:
         while lo < hi:
             # 取偏上的中点（+1），配合 lo = mid 才不会死循环。
             mid = (lo + hi + 1) // 2
-            if names_only + sum(min(len(x), mid) for x in descs) <= self.max_options:
+            if names_only + sum(min(len(x), mid) for x in descs) <= budget:
                 lo = mid  # mid 可行，答案至少是 mid
             else:
                 hi = mid - 1  # mid 不可行，答案一定小于 mid
@@ -200,9 +220,10 @@ class DecisionEncoder:
         head = [self.bos] + self._ids(f"{TYPE_PREFIX[d.type]}: ")[:8] + self._ids(d.instructions)[: self.max_instr]
         head.append(self.eos)
         ids = list(head)
-        # 第 2 步：选项区。
+        # 第 2 步：选项区。选项区最多能用的长度 = max_len - 头部 - 2 个 <eos>（选项后一个、末尾一个），
+        # 这样第 4 步的 room 一定 ≥ 0，整条序列一定不超过 max_len。
         marker_pos = []
-        for chunk in self._options(d):
+        for chunk in self._options(d, limit=self.max_len - len(head) - 2):
             # 标记位就是每个选项片段的第一个 token；此刻 len(ids) 正好是它将要放入的位置。
             marker_pos.append(len(ids))
             ids += chunk
@@ -212,6 +233,6 @@ class DecisionEncoder:
         room = self.max_len - len(ids) - 1
         state = self._ids(d.state)
         truncated = len(state) > room
-        # max(room, 0) 防止 room 为负数时切片出错（理论上选项预算保证了 room ≥ 0，这里是双保险）。
-        ids += state[: max(room, 0)] + [self.eos]
+        # 第 2 步传入的 limit 保证了 room ≥ 0，所以序列长度一定 ≤ max_len。
+        ids += state[:room] + [self.eos]
         return Encoded(ids, marker_pos, truncated)

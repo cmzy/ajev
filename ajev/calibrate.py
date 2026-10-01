@@ -59,6 +59,7 @@ import argparse
 import json
 import math
 import os
+import random
 
 from ajev import metrics
 from ajev.schema import Decision, read_jsonl
@@ -100,7 +101,9 @@ def fit_temperature(logits: list[list[float]], targets: list[list[float]]) -> fl
     第 2 步：黄金分割搜索（细搜）
         在网格最好点左右各一个网格步长的小区间 [best/1.15, best×1.15] 内精确定位。
         做法：在区间内取两个点 a、b（分别位于区间的 38.2% 和 61.8% 处），比较两点的 NLL，
-        把较差那一侧的一段区间丢掉；每轮区间缩小到原来的 0.618 倍，30 轮后区间宽度只剩
+        把较差那一侧的一段区间丢掉；每轮区间缩小到原来的 0.618 倍。黄金分割比的妙处在于：
+        缩小后的新区间里，有一个试探点恰好就是上一轮留下的那个点，所以每轮只需要新算 1 次 NLL
+        （每次算 NLL 都要遍历全部数据，省一半就是快一倍）。30 轮后区间宽度只剩
         原来的约 0.618^30 ≈ 0.0000005 倍，精度足够。
         优点：只需要计算函数值，不需要求导数；在这个小区间里 NLL 近似“单峰”（只有一个最低点），
         这种方法一定能收敛到它。
@@ -122,13 +125,19 @@ def fit_temperature(logits: list[list[float]], targets: list[list[float]]) -> fl
     # 第 2 步：在 best 左右各一个网格步长的区间内做黄金分割细搜。
     lo, hi = best / 1.15, best * 1.15
     g = (math.sqrt(5) - 1) / 2  # 黄金分割比 ≈ 0.618
+    a, b = hi - g * (hi - lo), lo + g * (hi - lo)  # 区间内的两个试探点，a 在左、b 在右
+    fa, fb = _nll(logits, targets, a), _nll(logits, targets, b)
     for _ in range(30):  # 用 “_” 作变量名表示“这个循环变量用不到”
-        a, b = hi - g * (hi - lo), lo + g * (hi - lo)  # 区间内的两个试探点，a 在左、b 在右
         # 如果 a 处更小，最低点一定不在 b 的右边，于是把右端点收缩到 b；反之把左端点收缩到 a。
-        if _nll(logits, targets, a) < _nll(logits, targets, b):
-            hi = b
+        # 收缩后，旧的 a（或 b）正好落在新区间的黄金分割点上，直接复用它和它的 NLL，只需新算一个点。
+        if fa < fb:
+            hi, b, fb = b, a, fa
+            a = hi - g * (hi - lo)
+            fa = _nll(logits, targets, a)
         else:
-            lo = a
+            lo, a, fa = a, b, fb
+            b = lo + g * (hi - lo)
+            fb = _nll(logits, targets, b)
     return (lo + hi) / 2  # 取最终小区间的中点作为结果
 
 
@@ -155,9 +164,12 @@ def main(argv: list[str] | None = None) -> None:
     执行步骤:
         第 1 步：加载 checkpoint（训练好的模型），读入验证数据；
         第 2 步：让模型对验证数据输出原始 logits（不使用任何已有温度）；
-        第 3 步：按题型拟合温度；
-        第 4 步：打印校准前后的指标对比；
-        第 5 步：把温度写回 checkpoint 的配置文件。
+        第 3 步：诚实地评估校准效果：随机留出一部分题（默认 30%）不参与拟合，只用剩下的题拟合温度，
+                再在留出的题上比较校准前后的指标。如果在拟合用的同一批题上比较，结果一定“变好”，
+                没有参考价值（这叫“样本内”评估，会过于乐观）；
+        第 4 步：用全部题重新拟合最终温度（数据越多越稳），这才是写进配置的温度；
+        第 5 步：把温度连同“这组温度是在第几步的模型上拟合的”一起写回 checkpoint 的配置文件。
+                如果之后模型又被继续训练、权重变了，推理时会提示温度已过期，需要重新校准。
     """
     # 延迟导入 torch 相关模块：这样本文件里的纯 Python 函数（比如 fit_temperature）
     # 在没有安装 torch 的环境中也能被导入和测试。
@@ -168,6 +180,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--data", nargs="+", required=True)  # nargs="+"：可以接收一个或多个文件路径
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--report-frac", type=float, default=0.3,
+                    help="fraction of decisions held out to report before/after metrics honestly")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
     # 第 1 步：把所有验证文件里的题合并成一个列表（嵌套列表推导式：先遍历文件，再遍历文件里的题）。
@@ -175,20 +190,31 @@ def main(argv: list[str] | None = None) -> None:
     # 第 2 步：temperatures={} 表示强制不使用 checkpoint 里已有的温度，这样拿到的是原始 logits。
     pred = EncoderPredictor(args.checkpoint, batch_size=args.batch_size, temperatures={})
     logits = pred.predict_logits(decisions)
-    # 第 3 步：拟合温度。
-    temps = fit(decisions, logits)
+    # 第 3 步：随机打乱下标后切成“拟合部分”和“留出部分”，用拟合部分的温度在留出部分上评估。
+    idx = list(range(len(decisions)))
+    random.Random(args.seed).shuffle(idx)
+    n_held = int(len(idx) * args.report_frac)
+    held, fit_idx = idx[:n_held], idx[n_held:]
+    if held:
+        t_fit = fit([decisions[i] for i in fit_idx], [logits[i] for i in fit_idx])
+        hd, hl = [decisions[i] for i in held], [logits[i] for i in held]
+        before = metrics.compute(hd, [softmax(lg) for lg in hl])
+        after = metrics.compute(hd, [softmax(lg, t_fit.get(d.type, 1.0)) for d, lg in zip(hd, hl)])
+        print(f"held-out check ({len(held)} decisions not used for fitting): temperatures {t_fit}")
+        # 预期：accuracy 不变（温度不改变排序），brier / kl / ece 下降或持平；如果反而变差，说明温度过拟合了。
+        for k in ("accuracy", "brier", "kl", "ece"):
+            print(f"{k:10s} before {before[k]:.4f}  after {after[k]:.4f}")
 
-    # 第 4 步：打印校准前后的对比。预期：accuracy 不变，brier / kl / ece 下降或持平。
-    before = metrics.compute(decisions, [softmax(lg) for lg in logits])
-    after = metrics.compute(decisions, [softmax(lg, temps.get(d.type, 1.0)) for d, lg in zip(decisions, logits)])
-    print(f"temperatures: {temps}")
-    for k in ("accuracy", "brier", "kl", "ece"):
-        print(f"{k:10s} before {before[k]:.4f}  after {after[k]:.4f}")
+    # 第 4 步：用全部数据拟合最终温度。
+    temps = fit(decisions, logits)
+    print(f"final temperatures (fitted on all {len(decisions)} decisions): {temps}")
 
     # 第 5 步：在原有配置（编码参数、基座模型名等）的基础上，只更新 temperatures 字段，不覆盖其他内容。
     path = os.path.join(args.checkpoint, AJEV_CONFIG)  # os.path.join 按操作系统规则拼接路径
     cfg = json.load(open(path)) if os.path.exists(path) else {}
     cfg["temperatures"] = temps
+    # 记下温度是在哪一步的权重上拟合的（训练保存 checkpoint 时会写入 step）。
+    cfg["calibrated_at_step"] = cfg.get("step")
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"wrote {path}")

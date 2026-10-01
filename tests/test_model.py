@@ -53,7 +53,8 @@ def test_encoder_markers_and_truncation():
     这道题：头部 "choice: q?" 约 12 个 token，3 个选项各 1+2+22 个 token 但预算只有 40，
     描述会被压缩；材料有 50 个字符，而总长度上限只有 64，所以 state 一定被截断。
     """
-    enc = DecisionEncoder(FakeTok(), max_len=64, max_options=40, min_desc=4)
+    # max_instr=16：max_len 只有 64，问题预算必须相应调小（否则构造时就会被拒绝，见下一个测试）。
+    enc = DecisionEncoder(FakeTok(), max_len=64, max_instr=16, max_options=40, min_desc=4)
     e = enc.encode(decision())
     assert len(e.input_ids) <= 64 and e.truncated_state
     assert [e.input_ids[p] for p in e.marker_pos] == [3, 3, 3]
@@ -61,16 +62,41 @@ def test_encoder_markers_and_truncation():
 
 
 def test_encoder_shrinks_descriptions_then_fails():
-    """选项区超预算时先压缩描述（仍保留全部 5 个标记位）；连选项名都放不下时报错。
+    """选项区超预算时先压缩描述（仍保留全部 5 个标记位）；连选项名都放不下整条序列时才报错。
 
-    max_options=10 时：5 个选项每个至少要 1（标记位）+ 2（选项名 "o0"）= 3 个 token，共 15 > 10，
-    所以 ``pytest.raises(ValueError)`` 期望这里抛出 ValueError。
+    - max_options=60：描述被压缩，5 个标记位都在；
+    - max_options=10：5 个选项光选项名就要 5 ×（1 个标记位 + 2）= 15 > 10。以前这里会直接报错，
+      现在预算自动放宽到 15（序列里还有足够空间），编码成功、描述全部去掉；
+    - 100 个选项、选项名各 4 个字符：光选项名就要 100 × 5 = 500 个 token，超过 max_len=200 能给的空间，
+      这道题在 200 个 token 内根本放不下，``pytest.raises(ValueError)`` 期望这里报错。
     """
     enc = DecisionEncoder(FakeTok(), max_len=512, max_options=60, min_desc=4)
     e = enc.encode(decision(n_opts=5, state=""))
     assert len(e.marker_pos) == 5
+    e = DecisionEncoder(FakeTok(), max_options=10).encode(decision(n_opts=5))
+    assert len(e.marker_pos) == 5
+    many = Decision(id="m", source="t", type="choice", state="", instructions="q?",
+                    options=[Option(f"o{i:03d}") for i in range(100)], target=[1.0] + [0.0] * 99)
     with pytest.raises(ValueError):
-        DecisionEncoder(FakeTok(), max_options=10).encode(decision(n_opts=5))
+        DecisionEncoder(FakeTok(), max_len=200, max_instr=16).encode(many)
+
+
+def test_encoder_never_exceeds_max_len():
+    """问题很长、选项很多时，序列长度也绝不超过 max_len（以前头部和选项区加起来可能超出）。
+
+    max_len=200，问题 300 个字符（截到 max_instr=128），8 个选项各带 60 字符描述：
+    头部约 1 + 8 + 128 + 1 = 138，选项区只剩约 60 个 token，描述被压缩；材料一个字都放不下。
+    """
+    long_q = Decision(id="l", source="t", type="choice", state="s" * 100, instructions="q" * 300,
+                      options=[Option(f"o{i}", "d" * 60) for i in range(8)], target=[1.0] + [0.0] * 7)
+    e = DecisionEncoder(FakeTok(), max_len=200, max_options=384).encode(long_q)
+    assert len(e.input_ids) <= 200 and len(e.marker_pos) == 8 and e.truncated_state
+
+
+def test_encoder_rejects_too_small_max_len():
+    """max_len 连头部（最长 1 + 8 + max_instr + 1）都放不下时，构造时就报错，而不是生成超长序列。"""
+    with pytest.raises(ValueError):
+        DecisionEncoder(FakeTok(), max_len=100, max_instr=128)
 
 
 def test_collate_and_unpermute():
@@ -124,3 +150,48 @@ def test_temperature_recovers_scale():
         logits.append([3 * x for x in z])  # 模型的 logits 放大了 3 倍，即过度自信 3 倍
         targets.append([1.0 if i == k else 0.0 for i in range(4)])
     assert fit_temperature(logits, targets) == pytest.approx(3, rel=0.35)
+
+
+def test_collate_view_b_only_for_non_score():
+    """训练 collate：视图 B 只包含 choice/noul 题，b_index 记录它们在本批中的位置，perm_b 宽度按视图 B 自己的最大选项数。
+
+    本批 3 道题：choice（2 个选项）、score（3 个等级）、noul（2 个选项）。
+    视图 B 只有第 0、2 道，所以 b_index = [0, 2]，perm_b 是 2 行 × 2 列（视图 B 中最多 2 个选项）。
+    """
+    from ajev.schema import Option as O
+    from ajev.train.train import TrainSet, make_collate
+
+    ds = [
+        Decision(id="c", source="t", type="choice", state="x", instructions="q", options=[O("a"), O("b")], target=[1, 0]),
+        Decision(id="s", source="t", type="score", state="x", instructions="q",
+                 options=[O("0"), O("1"), O("2")], target=[0, 1, 0]),
+        Decision(id="n", source="t", type="noul", state="x", instructions="q",
+                 options=[O("true"), O("false")], target=[0, 1]),
+    ]
+    ts = TrainSet(ds, DecisionEncoder(FakeTok(), max_len=64, max_instr=16), seed=0)
+    batch = make_collate(0)([ts[i] for i in range(3)])
+    assert batch["b_index"].tolist() == [0, 2]
+    assert batch["b"]["input_ids"].size(0) == 2 and tuple(batch["perm_b"].shape) == (2, 2)
+    assert tuple(batch["perm_a"].shape) == (3, 3)
+    # 一致性权重为 0 时完全不生成视图 B。
+    ts1 = TrainSet(ds, DecisionEncoder(FakeTok(), max_len=64, max_instr=16), seed=0, two_views=False)
+    batch1 = make_collate(0)([ts1[i] for i in range(3)])
+    assert batch1["b"] is None and batch1["b_index"].numel() == 0
+
+
+def test_checkpoint_integrity_via_meta(tmp_path):
+    """续训前的完整性检查：清单里记录的文件大小与磁盘一致才算完整；文件被截断就判为不完整。"""
+    import json
+
+    from ajev.train.train import META_FILE, STATE_FILE, checkpoint_step
+
+    d = tmp_path / "last"
+    d.mkdir()
+    files = {"model.safetensors": b"w" * 100, "decision_head.pt": b"h" * 10, STATE_FILE: b"s" * 50,
+             "ajev_config.json": json.dumps({"step": 7}).encode()}
+    for name, data in files.items():
+        (d / name).write_bytes(data)
+    (d / META_FILE).write_text(json.dumps({"step": 7, "sizes": {k: len(v) for k, v in files.items()}}))
+    assert checkpoint_step(str(d)) == 7
+    (d / "model.safetensors").write_bytes(b"w" * 40)  # 模拟写到一半被打断
+    assert checkpoint_step(str(d)) is None

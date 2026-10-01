@@ -15,7 +15,8 @@
                                                  两个视图的分布要一致（压制位置偏置）
 
 checkpoint：
-- ``{out}/last``：可续训，包含模型权重 + 优化器 / 学习率调度器 / GradScaler 状态 + 训练进度；
+- ``{out}/last``：可续训，包含模型权重 + 优化器 / 学习率调度器 / GradScaler 状态 + 训练进度，
+  以及一个记录各文件大小的清单 trainer_meta.json（用来检查完整性）；上一份保留为 ``{out}/last.prev``；
 - ``{out}/best``：验证集平均准确率最高的模型（只有权重，不含优化器状态）。
 再次运行同一条命令会自动从 ``last`` 续训。
 ``--hub-repo`` 会额外把 checkpoint 上传到 Hugging Face Hub（需要 HF_TOKEN），
@@ -46,7 +47,10 @@ checkpoint：
 4. 梯度累积（gradient accumulation）
    显存只够一次算 8 道题，但我们想要 16 道题的批大小（大 batch 梯度更稳）。做法：连续算 2 个
    小批（micro-batch），每次只 backward 不更新，梯度会自动累加；累积够了再做一次更新。
-   为了让累加结果等于“一个大批的平均梯度”，每个小批的损失要先除以累积次数 grad_accum。
+   为了让累加结果等于“一个大批里每道题的平均梯度”，本脚本先把每个小批里所有题的损失**加起来**
+   再 backward，等累积完再把梯度除以这几个小批的**总题数**。不能“每个小批先取平均、再除以 grad_accum”：
+   我们按 token 预算分批，各小批题数不同（长题批只有几道、短题批有几十道），先取平均会让长题的权重
+   被放大好几倍（详见训练主循环上方的说明和例子）。
 
 5. 梯度裁剪（gradient clipping）
    偶尔某个 batch 会产生特别大的梯度，一步就把参数改坏。裁剪规则：如果所有梯度合起来的长度
@@ -79,7 +83,7 @@ checkpoint：
     Colab 免费 VM 随时可能被回收，所以要能从中断处精确接着训。只存模型权重不够：
     - 优化器状态：Adam 的动量和方差，丢了相当于优化器“失忆”，训练会抖一下；
     - 学习率调度器状态：否则 warmup 会重新来一遍；
-    - GradScaler 状态：当前的放大倍数；
+    - GradScaler 状态：当前的放大倍数（在 bf16 的 GPU 上它是空的，换到 T4 续训时会跳过加载）；
     - 训练进度：step / micro_total / epoch / epoch_micro，用来跳过已经训练过的数据；
     - best：目前最好的验证分数，避免续训后把更差的模型当成 best 覆盖。
 
@@ -112,6 +116,9 @@ from ajev.train.losses import rps, smooth, soft_ce, symmetric_kl, unpermute
 
 # last checkpoint 中保存优化器、调度器、GradScaler 和训练进度的文件名。
 STATE_FILE = "trainer_state.pt"
+# 小的“清单”文件：记录步数和每个文件的字节数，最后一个写入。续训前靠它快速检查完整性，
+# 不必把约 1 GB 的 trainer_state.pt 整个读进内存。
+META_FILE = "trainer_meta.json"
 
 
 def checkpoint_step(path: str) -> int | None:
@@ -124,14 +131,28 @@ def checkpoint_step(path: str) -> int | None:
     判断标准（全部满足才算完整）：
     1. 权重 model.safetensors、决策头 decision_head.pt、配置 ajev_config.json、
        训练状态 trainer_state.pt 都存在；
-    2. trainer_state.pt 能被完整读出（文件被截断时 torch.load 会抛异常）；
-    3. 配置里记录的 step 与训练状态里的 step 一致（说明权重和状态是同一次保存写的）。
+    2. 有清单文件 trainer_meta.json 时（新版本保存的 checkpoint）：清单里记录的每个文件大小都与
+       磁盘上一致，且步数与配置一致。清单是最后写入的，它存在并且对得上，就说明前面的文件都写完了。
+       这样只需读几个小文件，不必把约 1 GB 的训练状态整个读一遍；
+    3. 没有清单时（旧版本保存的 checkpoint）：退回到完整读取 trainer_state.pt
+       （文件被截断时 torch.load 会抛异常），并核对其中的 step 与配置一致。
     """
     from ajev.model.encoder import AJEV_CONFIG, HEAD_FILE
 
     needed = ["model.safetensors", HEAD_FILE, AJEV_CONFIG, STATE_FILE]
     if not all(os.path.exists(os.path.join(path, f)) for f in needed):
         return None
+    meta_path = os.path.join(path, META_FILE)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            with open(os.path.join(path, AJEV_CONFIG)) as f:
+                cfg_step = json.load(f).get("step")
+        except Exception:
+            return None
+        sizes_ok = all(os.path.getsize(os.path.join(path, name)) == size for name, size in meta["sizes"].items())
+        return meta["step"] if sizes_ok and meta["step"] == cfg_step else None
     try:
         st = torch.load(os.path.join(path, STATE_FILE), map_location="cpu", weights_only=False)
         with open(os.path.join(path, AJEV_CONFIG)) as f:
@@ -173,10 +194,13 @@ class TrainSet(Dataset):
         target 始终按原始顺序存：[1, 0, 0]
     """
 
-    def __init__(self, decisions: list[Decision], encoder: DecisionEncoder, seed: int) -> None:
+    def __init__(self, decisions: list[Decision], encoder: DecisionEncoder, seed: int,
+                 two_views: bool = True) -> None:
         self.decisions = decisions
         self.encoder = encoder
         self.seed = seed
+        # 是否需要视图 B。一致性损失权重为 0 时不需要，省掉一半的分词和拼接工作。
+        self.two_views = two_views
         # 当前 epoch，由训练循环每轮开始时设置，影响打乱方式。
         self.epoch = 0
 
@@ -194,11 +218,17 @@ class TrainSet(Dataset):
         return self.encoder.encode(view), perm
 
     def __getitem__(self, i: int):
-        """返回 (原始题目, 视图A编码, 视图A的perm, 视图B编码, 视图B的perm)。"""
+        """返回 (原始题目, 视图A编码, 视图A的perm, 视图B编码, 视图B的perm)。
+
+        视图 B 只给 choice / noul 题生成：score 题不打乱选项，两个视图完全一样，一致性损失恒为 0，
+        生成了也是白算。不需要视图 B 时，后两项为 None。
+        """
         d = self.decisions[i]
         # 用字符串当种子：同一个 (seed, epoch, i) 永远得到同样的随机序列，结果可复现。
         rng = random.Random(f"{self.seed}/{self.epoch}/{i}")
         enc_a, perm_a = self._view(d, rng)
+        if not self.two_views or d.type == "score":
+            return d, enc_a, perm_a, None, None
         enc_b, perm_b = self._view(d, rng)
         return d, enc_a, perm_a, enc_b, perm_b
 
@@ -210,10 +240,13 @@ def make_collate(pad_id: int):
     这里用“函数里返回函数”（闭包）的写法，是为了把 pad_id 这个参数“记住”在 fn 里。
 
     返回的 batch 字典：
-    - ``a`` / ``b``: 两个视图各自的模型输入（见 ajev.model.batching.collate）；
-    - ``perm_a`` / ``perm_b``: [B, K]，两个视图的选项排列，用于把 logits 放回原始顺序；
+    - ``a``: 视图 A 的模型输入（见 ajev.model.batching.collate），包含本批全部 B 道题；
+    - ``perm_a``: [B, K]，视图 A 的选项排列，用于把 logits 放回原始顺序；
+    - ``b``: 视图 B 的模型输入，**只包含**有视图 B 的题（choice / noul），共 B' 道；一道都没有时为 None；
+    - ``perm_b``: [B', K']，视图 B 的选项排列（K' 是这 B' 道题里最多的选项数，K' ≤ K）；
+    - ``b_index``: [B']，视图 B 的每一行对应本批的第几道题，用来和视图 A 的对应行配对；
     - ``target``: [B, K]，原始选项顺序下的目标分布；
-    - ``is_score``: [B]，是否为 score 题（决定用不用 RPS、算不算一致性损失）。
+    - ``is_score``: [B]，是否为 score 题（决定用不用 RPS）。
 
     举个例子：一批 2 道题，第 1 道 2 个选项（choice），第 2 道 3 个选项（score）
         K = 3
@@ -227,19 +260,25 @@ def make_collate(pad_id: int):
     def fn(items):
         # zip(*items)：把“每条一个元组”的列表转置成“每个字段一个元组”。
         ds, enc_a, perm_a, enc_b, perm_b = zip(*items)
-        a, b = collate(list(enc_a), pad_id), collate(list(enc_b), pad_id)
-        # 两个视图是同一批题，选项数相同，所以 K 也相同。
+        a = collate(list(enc_a), pad_id)
         k = a["option_mask"].size(1)
 
-        def perm_tensor(perms):
+        def perm_tensor(perms, width):
             # 补齐位映射到自身，这样 unpermute 之后 -inf 仍然留在补齐位上。
-            return torch.tensor([p + list(range(len(p), k)) for p in perms])
+            return torch.tensor([p + list(range(len(p), width)) for p in perms])
 
+        # 视图 B 只收集有视图 B 的题，并记下它们在本批中的位置。
+        b_index = [i for i, e in enumerate(enc_b) if e is not None]
+        b = perm_b_t = None
+        if b_index:
+            b = collate([enc_b[i] for i in b_index], pad_id)
+            perm_b_t = perm_tensor([perm_b[i] for i in b_index], b["option_mask"].size(1))
         return {
             "a": a,
+            "perm_a": perm_tensor(perm_a, k),
             "b": b,
-            "perm_a": perm_tensor(perm_a),
-            "perm_b": perm_tensor(perm_b),
+            "perm_b": perm_b_t,
+            "b_index": torch.tensor(b_index, dtype=torch.long),
             "target": pad_targets([d.target for d in ds], k),  # 原始（未打乱）的选项顺序
             "is_score": torch.tensor([d.type == "score" for d in ds]),
         }
@@ -396,17 +435,43 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"[train] tokenizing {len(train)} decisions for length bucketing", flush=True)
     # 预先算出每道题的真实 token 长度，供按 token 预算分批使用（8.5 万道题约需 1 分钟）。
-    lengths = [len(encoder.encode(d).input_ids) for d in train]
+    # 顺便剔除在 max_len 内根本编码不了的题（选项多到连选项名都放不下），并报告数量，
+    # 而不是让它在训练中途某个 DataLoader 进程里报错、把整个训练中断。
+    kept, lengths = [], []
+    for d in train:
+        try:
+            lengths.append(len(encoder.encode(d).input_ids))
+            kept.append(d)
+        except ValueError as e:
+            print(f"[train] skipping {d.id}: {e}", flush=True)
+    if len(kept) < len(train):
+        print(f"[train] skipped {len(train) - len(kept)} decisions that cannot be encoded", flush=True)
+    train = kept
+
+    batch_cache: dict[int, list[list[int]]] = {}
 
     def epoch_batches(epoch: int) -> list[list[int]]:
-        """第 epoch 轮的分批结果；对同一个 epoch 是确定的，续训时可以据此跳过已训练的批。"""
-        return token_budget_batches(lengths, args.max_tokens, args.batch_size, seed=args.seed * 1000 + epoch)
+        """第 epoch 轮的分批结果；对同一个 epoch 是确定的，续训时可以据此跳过已训练的批。
+
+        结果缓存起来，因为算总步数、记录 epoch 进度和训练循环都会用到它。
+        """
+        if epoch not in batch_cache:
+            batch_cache[epoch] = token_budget_batches(lengths, args.max_tokens, args.batch_size,
+                                                      seed=args.seed * 1000 + epoch)
+        return batch_cache[epoch]
 
     # ---- 第 4 步：优化器、学习率调度、GradScaler ----
     # 一个优化器 step = grad_accum 个 micro-batch（梯度累积，见模块说明第 4 条）。
-    steps_per_epoch = math.ceil(len(epoch_batches(0)) / args.grad_accum)
+    # 每个 epoch 打乱后分出的批数略有不同，所以逐个 epoch 实际分批后求和，而不是用第 0 轮的批数乘以 epoch 数，
+    # 这样 --epochs 2 就恰好在第 2 轮数据用完时结束，余弦学习率也恰好在那时降到 0。
+    # 例如 --epochs 1.5：第 0 轮全部 + 第 1 轮的前一半。
+    full_epochs = int(args.epochs)
+    frac = args.epochs - full_epochs
+    total_micro = sum(len(epoch_batches(e)) for e in range(full_epochs))
+    if frac > 0:
+        total_micro += int(len(epoch_batches(full_epochs)) * frac)
     # 指定了 --max-steps 就用它，否则按 epoch 数换算总步数（`a or b`：a 为 0 时取 b）。
-    total_steps = args.max_steps or int(steps_per_epoch * args.epochs)
+    total_steps = args.max_steps or max(1, total_micro // args.grad_accum)
     # 两组学习率：主干是预训练好的，用小学习率微调，避免破坏已有知识；
     # 决策头是随机初始化的，需要较大学习率才能尽快学起来。
     head_params = list(model.head.parameters())
@@ -451,7 +516,11 @@ def main(argv: list[str] | None = None) -> None:
         st = torch.load(os.path.join(resume_dir, STATE_FILE), map_location="cpu", weights_only=False)
         optim.load_state_dict(st["optim"])
         sched.load_state_dict(st["sched"])
-        scaler.load_state_dict(st["scaler"])
+        # 在 bf16 的 GPU（A100/L4）上 GradScaler 是禁用的，保存的状态是空字典 {}；
+        # 换到 fp16 的 T4 上续训时，启用的 GradScaler 加载空字典会直接报错。
+        # 空状态就跳过加载，让 GradScaler 从默认放大倍数开始，几步之内就会自动调整到合适的值。
+        if st["scaler"]:
+            scaler.load_state_dict(st["scaler"])
         step, micro_total, best = st["step"], st["micro_total"], st["best"]
         epoch, epoch_micro = st["epoch"], st["epoch_micro"]
         print(f"[train] resumed from {resume_dir} at step {step}", flush=True)
@@ -502,6 +571,10 @@ def main(argv: list[str] | None = None) -> None:
             torch.save({"optim": optim.state_dict(), "sched": sched.state_dict(), "scaler": scaler.state_dict(),
                         "step": step, "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro,
                         "best": best}, os.path.join(tmp, STATE_FILE))
+            # 清单最后写：记录步数和每个文件的大小，续训前据此快速判断这份 checkpoint 是否完整。
+            sizes = {f: os.path.getsize(os.path.join(tmp, f)) for f in os.listdir(tmp)}
+            with open(os.path.join(tmp, META_FILE), "w") as f:
+                json.dump({"step": step, "sizes": sizes}, f)
         if os.path.exists(path):
             if os.path.exists(prev):
                 shutil.rmtree(prev)
@@ -531,23 +604,42 @@ def main(argv: list[str] | None = None) -> None:
             save(best_dir, with_state=False)
             log({"new_best": round(best, 4)})
 
-    trainset = TrainSet(train, encoder, args.seed)
+    trainset = TrainSet(train, encoder, args.seed, two_views=args.consistency_weight > 0)
     collate_fn = make_collate(tokenizer.pad_token_id)
+    # 参与更新的全部参数（梯度裁剪和梯度归一化都要遍历它们）。
+    params = [p for g in optim.param_groups for p in g["params"]]
+    # 损失的“参考题数”：反向传播前先把损失总和除以这个常数，让梯度数值大小和以前“取平均”时差不多
+    # （fp16 下梯度太大容易溢出）；真正的“除以实际题数”在参数更新前再补上，见第 5 步。
+    ref_n = args.batch_size * args.grad_accum
 
     # ---- 第 5 步：训练主循环 ----
     # 外层 while：每次循环跑一个 epoch（续训时从中断的 epoch 中间开始），直到达到总步数。
     # 内层 for：一次取一个 micro-batch。一次完整的训练 step 内部发生的事情：
-    #   第 1 步：把这一批两个视图的数据搬到 GPU；
-    #   第 2 步：在 autocast（混合精度）下做前向，得到两个视图的 logits，并用 unpermute 还原成原始选项顺序；
-    #   第 3 步：在 float32 下算损失 = 软标签 CE + RPS（只算 score 题）+ 一致性 KL（只算 choice/noul 题）；
-    #   第 4 步：损失除以 grad_accum，经 GradScaler 放大后 backward，梯度累加到参数的 .grad 上；
-    #   第 5 步：累积满 grad_accum 个 micro-batch 后：unscale 还原梯度 → 梯度裁剪 → 优化器更新参数
-    #           → 更新 GradScaler 倍数 → 清空梯度 → 学习率调度前进一步 → step 加 1；
+    #   第 1 步：把这一批数据搬到 GPU；
+    #   第 2 步：在 autocast（混合精度）下做前向：视图 A 跑全部题；视图 B 只跑 choice/noul 题
+    #           （score 题不打乱选项，没必要跑第二遍）。两个视图的 logits 都用 unpermute 还原成原始选项顺序；
+    #   第 3 步：在 float32 下算每道题的损失 = 软标签 CE + RPS（只算 score 题）+ 一致性 KL（只算 choice/noul 题）；
+    #   第 4 步：把本批每道题的损失**加起来**（不是取平均）再 backward，梯度累加到参数的 .grad 上，
+    #           同时累计这个更新窗口里一共有多少道题（window_n）；
+    #   第 5 步：累积满 grad_accum 个 micro-batch 后：unscale 还原梯度 → 梯度除以 window_n（得到“每道题
+    #           平均”的梯度）→ 梯度裁剪 → 优化器更新参数 → 更新 GradScaler → 清空梯度 → 学习率前进一步 → step 加 1；
     #   第 6 步：按需打印日志（每 20 步）、评估（每 eval_every 步）、保存（每 save_every 步）。
+    #
+    # 为什么第 4、5 步要“先加总、最后除以总题数”，而不是每个 micro-batch 内部取平均：
+    #   我们按 token 预算分批，长题的批次可能只有 8 道题，短题的批次有 32 道。如果每批先取平均，
+    #   两批对参数更新的贡献一样大，摊到每道长题上的影响力就是短题的 4 倍。
+    #   先加总、再除以整个更新窗口的总题数，每道题的权重就完全相同，不受它被分进大批还是小批的影响。
+    #   举个例子：一个窗口里有两批，A 批 8 道题损失总和 8.0，B 批 32 道题损失总和 16.0，
+    #   正确的平均损失是 (8 + 16) / 40 = 0.6；而“先各自平均再平均”会得到 (1.0 + 0.5) / 2 = 0.75。
     # model.train()：切换到训练模式，打开 Dropout。
     model.train()
-    # running 累计最近若干个 micro-batch 的各项损失，用于每 20 步打印一次平均值。
-    t0, running = time.time(), {"loss": 0.0, "ce": 0.0, "rps": 0.0, "cons": 0.0, "n": 0}
+
+    def fresh_running() -> dict:
+        """日志统计：各项损失的总和，以及对应的题数（每项只除以真正参与该项的题数）。"""
+        return {"loss": 0.0, "ce": 0.0, "n": 0, "rps": 0.0, "n_score": 0, "cons": 0.0, "n_cons": 0, "steps": 0}
+
+    t0, running = time.time(), fresh_running()
+    window_n = 0  # 当前更新窗口（grad_accum 个 micro-batch）里累计的题数
     while step < total_steps:
         trainset.epoch = epoch
         batches = epoch_batches(epoch)[epoch_micro:]  # 续训时跳过本 epoch 已训练过的批（分批是确定的）
@@ -557,48 +649,58 @@ def main(argv: list[str] | None = None) -> None:
         for batch in loader:
             # 第 1 步：数据搬到 GPU。
             a = {k: v.to(device) for k, v in batch["a"].items()}
-            b = {k: v.to(device) for k, v in batch["b"].items()}
             target = batch["target"].to(device)
             is_score = batch["is_score"].to(device)
             mask = a["option_mask"]
-            # 第 2 步：前向在 autocast 下进行（混合精度）；两个视图的 logits 都先 unpermute 回原始选项顺序。
+            # 第 2 步：前向（混合精度）。
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 logits_a = unpermute(model(**a), batch["perm_a"].to(device), mask)
-                # 只有存在 choice/noul 题时才需要跑视图 B（score 题不打乱、不算一致性），省一次前向。
-                use_b = args.consistency_weight > 0 and bool((~is_score).any())
-                logits_b = unpermute(model(**b), batch["perm_b"].to(device), mask) if use_b else None
-            # 第 3 步：算损失。损失在 autocast 之外用 float32 计算，数值更稳定。
+            # 第 3 步：算每道题的损失（[B]）。损失在 autocast 之外用 float32 计算，数值更稳定。
             # 交叉熵用平滑后的 target；RPS 用原始 target，且只对 score 题生效（乘以 is_score，非 score 题乘 0）。
             tgt = smooth(target, mask, args.label_smoothing)
             ce = soft_ce(logits_a, tgt, mask)
             r = rps(logits_a, target, mask) * is_score
             loss = ce + args.rps_weight * r
             cons = torch.zeros_like(ce)
-            if logits_b is not None:
-                # 一致性损失只对 choice/noul 题生效（score 题两个视图本来就一样）。
-                cons = symmetric_kl(logits_a, logits_b, mask) * (~is_score)
+            if batch["b"] is not None and args.consistency_weight > 0:
+                b = {k: v.to(device) for k, v in batch["b"].items()}
+                bi = batch["b_index"].to(device)  # 视图 B 的每一行对应本批第几道题
+                with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                    logits_b = unpermute(model(**b), batch["perm_b"].to(device), b["option_mask"])
+                kb = logits_b.size(1)
+                # 取出视图 A 中对应的行；这些题的选项数都 ≤ kb，所以只看前 kb 列就够了（后面全是补齐位）。
+                cons_rows = symmetric_kl(logits_a[bi, :kb], logits_b, b["option_mask"])
+                # index_copy：把这 B' 个一致性损失放回它们在本批中的位置，其余（score 题）保持 0。
+                cons = cons.index_copy(0, bi, cons_rows)
                 loss = loss + args.consistency_weight * cons
-            # 第 4 步：梯度累积：每个 micro-batch 的损失除以 grad_accum，累积 grad_accum 次后等价于一个大 batch。
-            # .mean()：把每道题的损失 [B] 平均成一个数，backward 需要一个标量。
-            loss = loss.mean() / args.grad_accum
-            # scaler.scale(loss)：fp16 时把损失乘以放大倍数再 backward；禁用时原样返回。
-            scaler.scale(loss).backward()
+            # 第 4 步：本批损失求和后除以常数 ref_n 再 backward（原因见上方说明）；累计窗口题数。
+            scaler.scale(loss.sum() / ref_n).backward()
+            window_n += loss.size(0)
 
-            # 记录日志用的损失（.item() 把只有一个数的张量取成 Python 数字）。
-            running["loss"] += loss.item() * args.grad_accum
-            running["ce"] += ce.mean().item()
-            running["rps"] += r.mean().item()
-            running["cons"] += cons.mean().item()
-            running["n"] += 1
+            # 记录日志用的损失总和与题数（.item() 把只有一个数的张量取成 Python 数字）。
+            n_score = int(is_score.sum())
+            running["loss"] += loss.sum().item()
+            running["ce"] += ce.sum().item()
+            running["n"] += loss.size(0)
+            running["rps"] += r.sum().item()
+            running["n_score"] += n_score
+            running["cons"] += cons.sum().item()
+            running["n_cons"] += int(batch["b_index"].numel())
             micro_total += 1
             epoch_micro += 1
             # 还没累积满 grad_accum 个 micro-batch，继续累积梯度，不更新参数。
             if micro_total % args.grad_accum:
                 continue
-            # 第 5 步：更新参数。先把梯度从 GradScaler 的放大倍数还原，再做梯度裁剪（范数上限 1.0）。
-            # 必须先 unscale 再裁剪，否则裁剪的是被放大过的梯度，阈值就没有意义了。
+            # 第 5 步：更新参数。先把梯度从 GradScaler 的放大倍数还原（unscale_），
+            # 再乘以 ref_n / window_n：此前 backward 的是“损失总和 / ref_n”，乘完之后就变成
+            # “损失总和 / window_n”，也就是整个窗口里每道题的平均损失对应的梯度。
             scaler.unscale_(optim)
-            gnorm = torch.nn.utils.clip_grad_norm_([p for g in optim.param_groups for p in g["params"]], 1.0)
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(ref_n / window_n)
+            window_n = 0
+            # 梯度裁剪（范数上限 1.0）。必须在 unscale 和归一化之后做，否则裁剪的阈值没有意义。
+            gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
             # 若出现 inf/NaN 梯度，scaler.step 会跳过本次更新，并在 update 时调小放大倍数。
             scaler.step(optim)
             scaler.update()
@@ -606,15 +708,25 @@ def main(argv: list[str] | None = None) -> None:
             optim.zero_grad(set_to_none=True)
             sched.step()
             step += 1
+            running["steps"] += 1
 
             # 第 6 步：日志 / 评估 / 保存。
             if step % 20 == 0 or step == 1:
-                n = running.pop("n")
-                # gnorm 是裁剪前的梯度范数，持续很大或突然飙升说明训练可能不稳定。
-                log({"epoch": round(step / steps_per_epoch, 3), "lr": sched.get_last_lr()[0],
-                     "gnorm": round(float(gnorm), 3), "sec_per_step": round((time.time() - t0) / 20, 2),
-                     **{k: round(v / n, 4) for k, v in running.items()}})
-                running = {"loss": 0.0, "ce": 0.0, "rps": 0.0, "cons": 0.0, "n": 0}
+                rn = running
+                # epoch 进度 = 已完成的整轮数 + 本轮已完成的比例。
+                # 每项损失只除以真正参与该项的题数：RPS 只算 score 题，一致性只算有视图 B 的题，
+                # 否则会被其他题的 0 稀释，真出问题时在日志里看不出来。
+                log({"epoch": round(epoch + epoch_micro / len(epoch_batches(epoch)), 3),
+                     "lr": sched.get_last_lr()[0],
+                     # gnorm 是裁剪前的梯度范数，持续很大或突然飙升说明训练可能不稳定。
+                     "gnorm": round(float(gnorm), 3),
+                     # 两次日志之间实际经过的步数（第 1 步时是 1，之后一般是 20）。
+                     "sec_per_step": round((time.time() - t0) / rn["steps"], 2),
+                     "loss": round(rn["loss"] / max(1, rn["n"]), 4),
+                     "ce": round(rn["ce"] / max(1, rn["n"]), 4),
+                     "rps": round(rn["rps"] / max(1, rn["n_score"]), 4),
+                     "cons": round(rn["cons"] / max(1, rn["n_cons"]), 4)})
+                running = fresh_running()
                 t0 = time.time()
             if step % args.eval_every == 0:
                 run_eval()

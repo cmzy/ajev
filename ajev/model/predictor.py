@@ -42,6 +42,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import torch
 
 from ajev.model.batching import collate, length_sorted_batches
@@ -144,6 +146,17 @@ class EncoderPredictor:
         self.batch_size = batch_size
         # 每种题型的温度由 ajev.calibrate 拟合；没有校准时默认 1.0。
         self.temperatures = temperatures if temperatures is not None else cfg.get("temperatures", {})
+        # 温度只对拟合它时的那份权重有效。没有温度，或者权重在校准之后又被训练改过
+        # （训练保存 checkpoint 时会重写配置、清掉温度，并更新 step），都要明确提示，
+        # 而不是悄悄用 T=1 输出未校准的概率。传入 temperatures={} 表示有意不用温度，不提示。
+        if temperatures is None:
+            if not self.temperatures:
+                print(f"[ajev] warning: {path} has no calibrated temperatures; probabilities are "
+                      "uncalibrated (run `python -m ajev.calibrate`)", file=sys.stderr)
+            elif cfg.get("calibrated_at_step") != cfg.get("step"):
+                print(f"[ajev] warning: temperatures in {path} were fitted at step "
+                      f"{cfg.get('calibrated_at_step')} but the weights are from step {cfg.get('step')}; "
+                      "re-run `python -m ajev.calibrate`", file=sys.stderr)
 
     def predict_logits(self, decisions: list[Decision]) -> list[list[float]]:
         """返回原始 logits（不做温度缩放），供温度校准使用。"""
