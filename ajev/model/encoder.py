@@ -201,8 +201,28 @@ class DecisionModel(nn.Module):
 
 
 def load_tokenizer(path: str):
-    """加载 tokenizer（HF 模型 id 如 "jhu-clsp/mmBERT-base"，或本地 checkpoint 目录均可）。"""
-    return AutoTokenizer.from_pretrained(path)
+    """加载 tokenizer（HF 模型 id 如 "jhu-clsp/mmBERT-base"，或本地 checkpoint 目录均可）。
+
+    版本兼容：transformers 5.x 保存的 tokenizer_config.json 把类名写成 ``TokenizersBackend``，
+    旧版（4.x，例如 Intel Mac 上只能用的版本）不认识这个类名，``AutoTokenizer`` 会报错。
+    这时退回到直接读 ``tokenizer.json``（分词规则本身在新旧版本之间是通用的），
+    再从 tokenizer_config.json 里补上特殊 token（<bos>、<eos>、<mask>、<pad> 等）。
+    两种方式切出来的 token id 完全相同。
+    """
+    try:
+        return AutoTokenizer.from_pretrained(path)
+    except (ValueError, AttributeError, ImportError):
+        cfg_path = os.path.join(path, "tokenizer_config.json")
+        tok_path = os.path.join(path, "tokenizer.json")
+        if not (os.path.exists(cfg_path) and os.path.exists(tok_path)):
+            raise
+        from transformers import PreTrainedTokenizerFast
+
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        special = {k: cfg[k] for k in ("bos_token", "eos_token", "unk_token", "pad_token", "mask_token",
+                                       "cls_token", "sep_token") if isinstance(cfg.get(k), str)}
+        return PreTrainedTokenizerFast(tokenizer_file=tok_path, **special)
 
 
 def load_ajev_config(path: str) -> dict:

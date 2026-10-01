@@ -15,6 +15,11 @@ train = [
     "transformers>=4.48",
     "accelerate>=1.0",
 ]
+# Inference HTTP server (python -m ajev.server).
+serve = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

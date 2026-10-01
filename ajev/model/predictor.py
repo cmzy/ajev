@@ -42,6 +42,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import torch
@@ -56,12 +57,27 @@ def autocast_dtype(device: torch.device) -> torch.dtype | None:
     """选择混合精度的数据类型（训练和推理共用）。
 
     - CPU：返回 None，不开混合精度（CPU 上 16 位计算通常没有加速效果）；
+    - Apple 芯片的 GPU（MPS）：也返回 None，用 float32。这个模型只有 3 亿参数，fp32 在 M 系列芯片上
+      已经足够快，而且与训练环境的数值最接近，部署后容易验证结果一致；
     - 支持 bf16 的 GPU（如 A100 / L4）：用 bfloat16，数值范围大，不需要 GradScaler；
     - 不支持 bf16 的 GPU（如 Colab 免费的 T4）：用 float16，训练时需配合 GradScaler 防止梯度下溢。
     """
     if device.type != "cuda":
         return None
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def default_device() -> torch.device:
+    """自动选择推理设备：NVIDIA GPU（cuda）> Apple 芯片 GPU（mps）> CPU。
+
+    MPS（Metal Performance Shaders）是 PyTorch 在 Apple 芯片（M1–M4）上调用 GPU 的方式，
+    需要 arm64 版本的 PyTorch；Intel Mac 上 ``torch.backends.mps.is_available()`` 通常为 False。
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 # @torch.no_grad() 是装饰器写法：整个函数体都在“不算梯度”的模式下运行。
@@ -101,7 +117,9 @@ def predict_logits(model: DecisionModel, encoder: DecisionEncoder, decisions: li
         # .to(device)：把张量从 CPU 内存搬到 GPU 显存（模型在哪，数据就要在哪）。
         batch = {k: v.to(device) for k, v in collate([encs[i] for i in idx], encoder.tok.pad_token_id).items()}
         # enabled=False 时 autocast 什么也不做，所以 CPU 上同一段代码也能跑。
-        with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+        # 不需要混合精度时（CPU / MPS）用空的上下文管理器 nullcontext()，根本不进入 autocast：
+        # 旧版 PyTorch（例如 2.2）不支持对 MPS 创建 autocast，即使 enabled=False 也会直接报错。
+        with torch.autocast(device.type, dtype=dtype) if dtype is not None else contextlib.nullcontext():
             logits = model(**batch)
         # .cpu() 搬回 CPU，.tolist() 转成普通 Python 列表。
         for row, i in zip(logits.float().cpu(), idx):
@@ -124,7 +142,7 @@ class EncoderPredictor:
 
     Args:
         path: checkpoint 目录（包含主干权重、decision_head.pt、tokenizer、ajev_config.json）。
-        device: "cuda" / "cpu"；不传时有 GPU 就用 GPU。
+        device: "cuda" / "mps" / "cpu"；不传时自动选择（见 ``default_device``）。
         batch_size: 推理时每批最多多少道题（越大越快，但越占显存）。
         temperatures: 每种题型的温度，例如 ``{"noul": 1.2, "choice": 0.9}``。
             传 None 时读取 ajev_config.json 中的值；传 ``{}`` 表示强制不校准（拟合温度时就这样用，
@@ -137,7 +155,7 @@ class EncoderPredictor:
 
     def __init__(self, path: str, device: str | None = None, batch_size: int = 32,
                  temperatures: dict[str, float] | None = None) -> None:
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = torch.device(device) if device else default_device()
         cfg = load_ajev_config(path)
         # 编码参数（如 max_len）沿用训练时保存的配置，保证推理与训练输入一致。
         # **cfg.get("encoding", {}) 把字典展开成关键字参数，例如 max_len=1024。
