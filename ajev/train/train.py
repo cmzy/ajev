@@ -95,6 +95,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 
 import torch
@@ -111,6 +112,49 @@ from ajev.train.losses import rps, smooth, soft_ce, symmetric_kl, unpermute
 
 # last checkpoint 中保存优化器、调度器、GradScaler 和训练进度的文件名。
 STATE_FILE = "trainer_state.pt"
+
+
+def checkpoint_step(path: str) -> int | None:
+    """检查一个可续训的 checkpoint 目录是否完整；完整则返回它的步数，否则返回 None。
+
+    为什么需要：Colab 的 VM 可能在任意时刻被回收。如果恰好在写 checkpoint 时被打断，
+    目录里可能只有一半文件，或者文件被截断。续训时如果直接加载这种目录，要么报错，
+    要么（更糟）权重和优化器状态来自不同的步数。
+
+    判断标准（全部满足才算完整）：
+    1. 权重 model.safetensors、决策头 decision_head.pt、配置 ajev_config.json、
+       训练状态 trainer_state.pt 都存在；
+    2. trainer_state.pt 能被完整读出（文件被截断时 torch.load 会抛异常）；
+    3. 配置里记录的 step 与训练状态里的 step 一致（说明权重和状态是同一次保存写的）。
+    """
+    from ajev.model.encoder import AJEV_CONFIG, HEAD_FILE
+
+    needed = ["model.safetensors", HEAD_FILE, AJEV_CONFIG, STATE_FILE]
+    if not all(os.path.exists(os.path.join(path, f)) for f in needed):
+        return None
+    try:
+        st = torch.load(os.path.join(path, STATE_FILE), map_location="cpu", weights_only=False)
+        with open(os.path.join(path, AJEV_CONFIG)) as f:
+            cfg_step = json.load(f).get("step")
+    except Exception:  # 文件被截断 / 损坏
+        return None
+    return st["step"] if st.get("step") == cfg_step else None
+
+
+def find_resumable(last_dir: str) -> str | None:
+    """在 ``last`` 和它的备份 ``last.prev`` 中，找出最新的完整 checkpoint。
+
+    返回可用的目录；两个都不存在时返回 None（表示从头训练）；
+    目录存在但都不完整时直接报错退出，避免悄悄从头开始、浪费已有进度。
+    """
+    candidates = [(checkpoint_step(p), p) for p in (last_dir, last_dir + ".prev") if os.path.isdir(p)]
+    if not candidates:
+        return None
+    valid = [(s, p) for s, p in candidates if s is not None]
+    if not valid:
+        raise SystemExit(f"checkpoints under {last_dir}(.prev) are all incomplete; "
+                         "move them away to start fresh")
+    return max(valid)[1]
 
 
 class TrainSet(Dataset):
@@ -324,9 +368,10 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     last_dir, best_dir = os.path.join(args.out, "last"), os.path.join(args.out, "best")
-    # last 目录下有 trainer_state.pt 就说明可以续训，此时模型和 tokenizer 都从 last 加载。
-    resume = os.path.exists(os.path.join(last_dir, STATE_FILE))
-    src = last_dir if resume else args.model
+    # 在 last 和备份 last.prev 中找最新的完整 checkpoint；找到就续训，模型和 tokenizer 都从那里加载。
+    resume_dir = find_resumable(last_dir)
+    resume = resume_dir is not None
+    src = resume_dir if resume else args.model
 
     tokenizer = load_tokenizer(src)
     encoding_cfg = {"max_len": args.max_len}
@@ -403,13 +448,13 @@ def main(argv: list[str] | None = None) -> None:
     step, micro_total, epoch, epoch_micro, best = 0, 0, 0, 0, -1.0
     if resume:
         # weights_only=False：trainer_state.pt 里不只是张量，还有普通的 Python 数字，需要完整反序列化。
-        st = torch.load(os.path.join(last_dir, STATE_FILE), map_location="cpu", weights_only=False)
+        st = torch.load(os.path.join(resume_dir, STATE_FILE), map_location="cpu", weights_only=False)
         optim.load_state_dict(st["optim"])
         sched.load_state_dict(st["sched"])
         scaler.load_state_dict(st["scaler"])
         step, micro_total, best = st["step"], st["micro_total"], st["best"]
         epoch, epoch_micro = st["epoch"], st["epoch_micro"]
-        print(f"[train] resumed from {last_dir} at step {step}", flush=True)
+        print(f"[train] resumed from {resume_dir} at step {step}", flush=True)
 
     os.makedirs(args.out, exist_ok=True)
     # 保存本次运行的参数，以后查看结果时知道是用什么配置训练的。
@@ -440,12 +485,30 @@ def main(argv: list[str] | None = None) -> None:
         with_state=True 时额外保存优化器等状态（用于 last，可续训，原因见模块说明第 10 条）；
         best 只存权重，因为它只用来推理，不需要续训，省空间（优化器状态比权重本身还大）。
         配置了 --hub-repo 时在后台线程上传到 HF Hub（run_as_future=True，不阻塞训练）。
+
+        “原子”保存，防止写到一半被打断导致 checkpoint 损坏：
+        1. 先把所有文件写进临时目录 ``{path}.tmp``；
+        2. 全部写完后，把旧的 ``{path}`` 改名为 ``{path}.prev``（覆盖更早的备份）；
+        3. 再把 ``{path}.tmp`` 改名为 ``{path}``。
+        改名几乎是瞬间完成的，所以任何时刻被打断，``{path}`` 或 ``{path}.prev`` 至少有一个是完整的。
+        续训时 find_resumable 会自动挑出最新的完整那一个。
+        best 只用于推理，不需要保留备份，替换成功后删掉 .prev 以节省空间。
         """
-        model.save(path, tokenizer, extra={"encoding": encoding_cfg, "base_model": args.model, "step": step})
+        tmp, prev = path + ".tmp", path + ".prev"
+        if os.path.exists(tmp):  # 上次写到一半留下的残骸
+            shutil.rmtree(tmp)
+        model.save(tmp, tokenizer, extra={"encoding": encoding_cfg, "base_model": args.model, "step": step})
         if with_state:
             torch.save({"optim": optim.state_dict(), "sched": sched.state_dict(), "scaler": scaler.state_dict(),
                         "step": step, "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro,
-                        "best": best}, os.path.join(path, STATE_FILE))
+                        "best": best}, os.path.join(tmp, STATE_FILE))
+        if os.path.exists(path):
+            if os.path.exists(prev):
+                shutil.rmtree(prev)
+            os.rename(path, prev)
+        os.rename(tmp, path)
+        if not with_state and os.path.exists(prev):
+            shutil.rmtree(prev)
         if hub:
             hub.upload_folder(repo_id=args.hub_repo, folder_path=path, path_in_repo=os.path.basename(path),
                               run_as_future=True)
