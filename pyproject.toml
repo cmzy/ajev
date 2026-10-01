@@ -1,0 +1,27 @@
+[project]
+name = "ajev"
+version = "0.1.0"
+description = "AJev: a Jev-style typed decision model (noul / choice / score) with calibrated probabilities"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Training deps are installed on the Colab VM; torch has no recent wheels for Intel macOS.
+train = [
+    "torch>=2.4",
+    "transformers>=4.48",
+    "accelerate>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
