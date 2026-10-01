@@ -150,10 +150,12 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True)
     src = ap.add_mutually_exclusive_group(required=True)  # 互斥参数组：下面两个参数必须且只能给一个
-    src.add_argument("--predictor", choices=["uniform", "random", "prior", "model"])
+    src.add_argument("--predictor", choices=["uniform", "random", "prior", "model", "lm"])
     src.add_argument("--predictions")
     ap.add_argument("--train", help="train JSONL (needed by --predictor prior)")
     ap.add_argument("--checkpoint", help="model directory (needed by --predictor model)")
+    ap.add_argument("--lm-model", help="HF id or path of a chat LLM (needed by --predictor lm), "
+                                       "e.g. google/gemma-4-12B-it")
     ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
@@ -177,6 +179,13 @@ def main(argv: list[str] | None = None) -> None:
             from ajev.model.predictor import EncoderPredictor
 
             predictor = EncoderPredictor(args.checkpoint)
+        elif args.predictor == "lm":
+            # 大语言模型零样本：读字母选项的 logits（见 ajev/lm/predictor.py）。
+            if not args.lm_model:
+                raise SystemExit("--predictor lm needs --lm-model")
+            from ajev.lm.predictor import LMPredictor
+
+            predictor = LMPredictor(args.lm_model)
         else:
             predictor = UniformPredictor() if args.predictor == "uniform" else RandomPredictor()
         preds = predictor.predict(decisions)
