@@ -1,19 +1,63 @@
 #!/usr/bin/env python3
-"""Drive training on a Colab VM through the `colab` CLI.
+"""通过 Google 官方的 `colab` CLI，在 Colab VM 上驱动 AJev 的训练。
 
-    python scripts/colab_job.py up      -s ajev --gpu T4 --data data/build   # create VM, push code + data, install
-    python scripts/colab_job.py drive   -s ajev                              # mount Google Drive at /content/drive
+本地写代码、远程 GPU 训练：这个脚本把“开 VM → 上传代码和数据 → 安装 → 后台训练 →
+查看进度 → 下载结果 → 释放 VM”这一整套操作封装成几个子命令。它对应 AJev 流程中的
+“训练”环节（数据在本地由 ajev.data.build 构建好后上传）。
+
+用法::
+
+    python scripts/colab_job.py up      -s ajev --gpu T4 --data data/build   # 开 VM，上传代码和数据，安装
+    python scripts/colab_job.py drive   -s ajev                              # 把 Google Drive 挂载到 /content/drive
     python scripts/colab_job.py train   -s ajev --run sft1 -- --epochs 3 --grad-ckpt
-    python scripts/colab_job.py status  -s ajev --run sft1                   # GPU + last log lines
-    python scripts/colab_job.py fetch   -s ajev --run sft1 --what best       # download runs/<run>/<what>
+    python scripts/colab_job.py status  -s ajev --run sft1                   # GPU 状态 + 最后几行日志
+    python scripts/colab_job.py fetch   -s ajev --run sft1 --what best       # 下载 runs/<run>/<what>
     python scripts/colab_job.py stop    -s ajev
 
-Training runs detached (nohup) on the VM, so the local terminal can disconnect. With
-`--drive`, run directories live on Google Drive and survive a reclaimed VM (if Drive
-mounting works for your account; otherwise `fetch --what last` periodically or pass
-`--hub-repo` to training). Re-running `train` with the same --run resumes from `last`.
+训练进程在 VM 上以脱离会话的方式在后台运行（类似 nohup），本地终端断开也不影响训练。
+加 ``--drive`` 时，运行目录放在 Google Drive 上，VM 被回收也不会丢失 checkpoint
+（前提是你的账号能成功挂载 Drive；否则就定期 ``fetch --what last`` 下载到本地，
+或者给训练脚本传 ``--hub-repo`` 上传到 HF Hub）。用同一个 ``--run`` 再次执行 ``train``，
+会从该运行目录下的 ``last`` checkpoint 断点续训。
 
-Note: code is sent to the VM as a file (`colab exec -f`); piping code on stdin hangs.
+几个踩过的坑：
+
+* 代码要以文件形式发给 VM（``colab exec -f``）；通过 stdin 管道传代码会一直卡住；
+* ``colab drivemount`` 第一次使用时需要真人在终端里打开授权链接并按回车，
+  授权过一次之后，非交互调用也能挂载成功；
+* 挂载失败时 ``drivemount`` 不一定返回非零退出码，所以 ``drive`` 子命令会再检查一次是否真的挂上；
+* websocket 偶尔会断（"Connection was lost"），远程执行会自动重试。
+
+------------------------------------------------------------------------------
+给初学者的背景知识
+------------------------------------------------------------------------------
+
+【VM 与会话（session）】
+VM（虚拟机）就是 Google 数据中心里临时租给你的一台带 GPU 的 Linux 电脑。``colab new`` 申请一台，
+``colab stop`` 归还。每台 VM 上跑着一个 Jupyter kernel（Python 解释器进程），``colab exec``
+就是把代码发给这个 kernel 执行，效果和在 Colab 网页的代码格子里运行一样。
+“会话”是本地给这台 VM 起的名字（``-s ajev``），后续命令靠它找到同一台 VM。
+注意：VM 上的文件是临时的，VM 被归还或被 Google 回收后，/content 下的东西全部消失。
+
+【后台进程 / nohup】
+训练要跑好几个小时，而 ``colab exec`` 只是一次短连接。如果让训练在 exec 里直接运行，
+连接一断训练就跟着停了。所以这里用 ``subprocess.Popen`` 在 VM 上另起一个独立进程跑训练，
+并让它脱离当前会话（start_new_session=True，效果类似 Linux 的 nohup 命令）：
+exec 立刻返回，训练在后台继续跑，日志写到文件里，之后用 ``status`` 去看。
+
+【僵尸进程】
+在 Linux 里，子进程结束后，要等父进程“回收”（读取它的退出状态）才会彻底消失；
+在被回收之前，它会以“僵尸”（状态 Z）的形式留在进程表里。我们的训练进程是 kernel 的子进程，
+kernel 不会主动回收它，所以训练崩溃后 /proc/<pid> 目录仍然存在，必须读状态字段才能判断它其实已经死了。
+
+【tar 打包上传】
+代码目录里有很多小文件，一个个上传很慢。tar.gz 把整个目录打包并压缩成一个文件，
+上传一次，再在 VM 上解压，目录结构保持不变。
+
+【Google Drive 挂载】
+“挂载”就是把你的 Google Drive 变成 VM 上的一个文件夹（/content/drive/MyDrive）。
+往这个文件夹里写文件，就等于写进了你的 Drive，VM 被回收后文件依然在 Drive 里，
+所以 checkpoint 放在这里，就能在新 VM 上断点续训。
 """
 
 from __future__ import annotations
@@ -28,20 +72,50 @@ import tempfile
 import textwrap
 import time
 
+# 本地仓库根目录（本文件位于 <ROOT>/scripts/ 下）。
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# VM 上存放代码和数据的目录；/content 是 Colab 的默认工作目录。
 REMOTE = "/content/AJev"
+# 挂载 Drive 后，运行目录（checkpoint、日志）所在位置，对应你 Drive 里的 MyDrive/ajev/runs/。
 DRIVE_RUNS = "/content/drive/MyDrive/ajev/runs"
+# 需要上传到 VM 的代码路径（相对仓库根目录）；数据单独打包上传。
 CODE_PATHS = ["ajev", "scripts", "pyproject.toml", "README.md"]
 
 
 def colab(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """调用本地的 ``colab`` 命令行，并先打印出要执行的完整命令，方便排查。
+
+    ``check=True`` 时命令返回非零退出码会抛出 ``CalledProcessError``；
+    需要自己处理失败（例如重试）时传 ``check=False``。
+
+    举个例子：colab("stop", "-s", "ajev")
+        → 先打印 "$ colab stop -s ajev"，再真正执行这条命令。
+    ``*args`` 表示把任意多个位置参数收集成一个元组；``shlex.quote`` 会给含空格等特殊字符的参数加引号，
+    这样打印出来的命令可以直接复制到终端里运行。
+    """
     print("$ colab " + " ".join(shlex.quote(a) for a in args), flush=True)
     return subprocess.run(["colab", *args], check=check)
 
 
 def remote_python(session: str, code: str, retries: int = 3) -> None:
-    """Run code on the VM. The kernel websocket sometimes drops ("Connection was lost"),
-    typically on the first call after a while; retry a few times."""
+    """在 VM 的 Jupyter kernel 里执行一段 Python 代码。
+
+    做法：把代码（先用 ``textwrap.dedent`` 去掉公共缩进）写进本地临时 .py 文件，
+    再用 ``colab exec -f`` 发送执行——通过 stdin 管道传代码会卡住，所以必须走文件。
+
+    kernel 的 websocket 偶尔会断开（报 "Connection was lost"），通常发生在空闲一段时间后的
+    第一次调用，因此失败时最多重试 ``retries`` 次，每次间隔 5 秒；全部失败则退出。
+    注意：重试意味着同一段代码可能被执行多次，所以发过去的代码应当是幂等的
+    （例如 ``train`` 会先检查是否已有训练进程在跑）。
+    “幂等”的意思是：执行一次和执行多次的效果相同。
+
+    处理步骤：
+        第 1 步：写临时文件（delete=False 让文件在 with 结束后仍保留，供 colab exec 读取）；
+        第 2 步：最多尝试 retries 次 colab exec，成功（退出码 0）就返回；
+        第 3 步：无论成功失败，finally 里都删除临时文件，不在本地留垃圾。
+
+    举个例子：remote_python("ajev", "print(1 + 1)") → VM 上执行后，本地终端打印 2。
+    """
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(textwrap.dedent(code))
         path = f.name
@@ -58,6 +132,16 @@ def remote_python(session: str, code: str, retries: int = 3) -> None:
 
 
 def make_tar(paths: list[str], base: str, name: str) -> str:
+    """把 ``base`` 下的若干路径打包成系统临时目录中的 ``name``（tar.gz），返回压缩包路径。
+
+    包内路径保持相对 ``base`` 的结构（arcname），解压到 VM 的 REMOTE 目录后与本地仓库布局一致；
+    ``__pycache__`` 会被过滤掉，减少上传体积。
+
+    举个例子：make_tar(["ajev", "scripts"], ROOT, "ajev_code.tar.gz")
+        → 生成 /tmp/.../ajev_code.tar.gz，包内是 ajev/... 和 scripts/... 两个目录。
+    ``filter`` 参数是一个函数：对包里的每个文件调用一次，返回 None 表示“不要这个文件”，
+    原样返回 ti 表示保留。这里用 lambda 写成一行。
+    """
     out = os.path.join(tempfile.gettempdir(), name)
     with tarfile.open(out, "w:gz") as tar:
         for p in paths:
@@ -67,18 +151,38 @@ def make_tar(paths: list[str], base: str, name: str) -> str:
 
 
 def runs_dir(drive: bool) -> str:
+    """返回运行目录的根：``--drive`` 时在 Google Drive 上（VM 回收后仍在），否则在 VM 本地磁盘上。"""
     return DRIVE_RUNS if drive else f"{REMOTE}/runs"
 
 
 def cmd_up(a) -> None:
+    """``up`` 子命令：准备好一台可以训练的 VM。
+
+    1. 若同名会话不存在则新建（可指定 GPU 类型，默认 T4）；已存在则复用，只重新上传代码；
+    2. 打包上传代码；如果传了 ``--data``，把本地数据目录也打包上传；
+    3. 在 VM 上解压到 REMOTE，并以 ``pip install --no-deps -e`` 安装 ajev 包，
+       最后打印 torch / transformers 版本和 GPU 信息，确认环境可用。
+
+    “可编辑安装”（pip install -e）：不把代码复制进 site-packages，而是让 Python 直接从
+    /content/AJev 目录导入 ajev 包。以后重新上传代码、覆盖这个目录，就能立刻生效，不用重装。
+
+    举个例子：python scripts/colab_job.py up -s ajev --gpu T4 --data data/build
+        → 新开一台 T4（若 ajev 会话不存在），上传代码和 data/build，安装后打印类似
+          "torch 2.11.0 transformers 5.16.1 cuda True Tesla T4"。
+    """
+    # 第 1 步：用会话列表输出中是否出现 "[会话名]" 来判断会话是否已存在，不存在才新开 VM。
+    # capture_output=True 把命令输出收集成字符串（而不是打印到屏幕），text=True 表示按文本解码。
     sessions = subprocess.run(["colab", "sessions"], capture_output=True, text=True).stdout
     if f"[{a.session}]" not in sessions:
         colab("new", "-s", a.session, *(["--gpu", a.gpu] if a.gpu else []))
+    # 第 2 步：打包并上传代码；有 --data 时再打包上传数据目录。
     code = make_tar(CODE_PATHS, ROOT, "ajev_code.tar.gz")
     colab("upload", "-s", a.session, code, "/content/ajev_code.tar.gz")
     if a.data:
         data = make_tar([os.path.relpath(a.data, ROOT)], ROOT, "ajev_data.tar.gz")
         colab("upload", "-s", a.session, data, "/content/ajev_data.tar.gz")
+    # 第 3 步（远程执行）：解压并删除压缩包；Colab 已预装 torch / transformers / datasets，
+    # 用 --no-deps 只安装 ajev 本身，避免 pip 改动 Colab 自带的依赖版本。
     remote_python(a.session, f"""
         import os, subprocess, tarfile
         os.makedirs("{REMOTE}", exist_ok=True)
@@ -97,6 +201,21 @@ def cmd_up(a) -> None:
 
 
 def cmd_drive(a) -> None:
+    """``drive`` 子命令：在 VM 上挂载 Google Drive，并确认挂载成功。
+
+    第一次使用需要你本人在终端里运行 ``colab drivemount`` 完成授权（要打开链接并按回车），
+    之后本命令可以非交互地挂载。挂载后会再用 ``os.path.ismount`` 检查一次：
+    ``drivemount`` 失败时不一定返回非零退出码，如果不检查，后面 ``os.makedirs`` 会在 VM
+    本地磁盘上建出一个同名目录，看起来像存进了 Drive，实际上 VM 一回收就全丢了。
+
+    ``os.path.ismount(路径)`` 判断该路径是不是一个真正的挂载点（另一个文件系统接入的位置），
+    普通文件夹返回 False，所以可以用来区分“真的 Drive”和“本地同名目录”。
+
+    处理步骤：
+        第 1 步：执行 colab drivemount；
+        第 2 步：远程检查 /content/drive 是否真的是挂载点，不是就报错退出；
+        第 3 步：在 Drive 上创建运行目录根（MyDrive/ajev/runs）并列出已有的运行。
+    """
     colab("drivemount", "-s", a.session)
     remote_python(a.session, f"""
         import os
@@ -109,10 +228,38 @@ def cmd_drive(a) -> None:
 
 
 def cmd_train(a) -> None:
+    """``train`` 子命令：在 VM 上后台启动 ``python -m ajev.train.train``。
+
+    * 训练集 / 验证集固定取 VM 上 ``<REMOTE>/<data_dir>`` 下的 train.jsonl、val.jsonl、val_typed.jsonl，
+      ``--`` 之后的参数原样转发给训练脚本；
+    * 输出目录为 ``<runs_dir>/<run>``；目录里已有 ``last`` checkpoint 时训练脚本会自动续训；
+    * 启动前检查 pid 文件：若该运行目录已有训练进程在跑（且不是僵尸进程）就拒绝再启动一个，
+      防止 ``remote_python`` 重试或误操作导致两个进程同时写同一个目录；
+    * 用 ``start_new_session=True`` 让训练进程脱离 kernel 的会话，标准输出 / 错误写入
+      ``stdout.log``，进程号写入 ``pid`` 文件，供 ``status`` 查询。
+
+    举个例子：
+        python scripts/colab_job.py train -s ajev --run sft1 --drive -- --epochs 2 --grad-ckpt
+        → 在 VM 上后台执行：
+          python -m ajev.train.train --train /content/AJev/data/build/train.jsonl
+              --val /content/AJev/data/build/val.jsonl /content/AJev/data/build/val_typed.jsonl
+              --out /content/drive/MyDrive/ajev/runs/sft1 --epochs 2 --grad-ckpt
+
+    处理步骤：
+        第 1 步：确定输出目录和数据目录，拼出完整的训练命令；
+        第 2 步（远程）：创建输出目录，检查是否已有活着的训练进程，有就拒绝启动；
+        第 3 步（远程）：以追加模式打开 stdout.log，用 Popen 在后台启动训练；
+        第 4 步（远程）：把进程号写入 pid 文件，打印启动信息后立即返回（不等训练结束）。
+
+    远程代码里的 ``{out!r}`` 是 f-string 的写法：!r 表示用 repr() 插入，
+    字符串会自带引号，生成的远程代码才是合法的 Python。
+    """
+    # 第 1 步：拼出输出目录、数据目录和训练命令行参数。
     out = f"{runs_dir(a.drive)}/{a.run}"
     data = f"{REMOTE}/{a.data_dir}"
     args = ["--train", f"{data}/train.jsonl", "--val", f"{data}/val.jsonl", f"{data}/val_typed.jsonl",
             "--out", out, *a.train_args]
+    # 用 shlex.quote 逐个转义参数后拼成一条 shell 命令，参数里有空格或特殊字符也安全。
     cmd = " ".join(shlex.quote(x) for x in ["python", "-m", "ajev.train.train", *args])
     remote_python(a.session, f"""
         import os, subprocess
@@ -131,6 +278,25 @@ def cmd_train(a) -> None:
 
 
 def cmd_status(a) -> None:
+    """``status`` 子命令：打印 GPU 利用率 / 显存、训练进程是否还活着，以及 stdout.log 的最后 ``--lines`` 行。
+
+    判断进程存活时除了看 ``/proc/<pid>`` 是否存在，还要看进程状态是不是 "Z"（僵尸）：
+    训练进程是 kernel 的子进程，崩溃后若父进程没有回收，会以僵尸状态残留在 /proc 中，
+    只看目录是否存在会误报为“运行中”。
+
+    ``/proc/<pid>/stat`` 是 Linux 提供的进程信息文件，内容用空格分隔，第 3 个字段就是进程状态
+    （R=运行、S=睡眠、Z=僵尸……），所以代码里取 ``split()[2]``。
+
+    举个例子：python scripts/colab_job.py status -s ajev --run sft1 --drive --lines 5
+        → 输出类似：
+          99 %, 8559 MiB, 15360 MiB
+          pid 1657 running
+          {"step": 20, "epoch": 0.014, "loss": 1.5887, ...}
+          ...（最后 5 行日志）
+
+    远程代码中的 ``{{pid}}``：外层是本地的 f-string，双花括号表示“输出一个字面的 {”，
+    这样发到 VM 上的代码里才是 ``f"/proc/{pid}/stat"``，由 VM 上的 Python 再去替换。
+    """
     out = f"{runs_dir(a.drive)}/{a.run}"
     remote_python(a.session, f"""
         import os, subprocess
@@ -147,6 +313,20 @@ def cmd_status(a) -> None:
 
 
 def cmd_fetch(a) -> None:
+    """``fetch`` 子命令：把 VM 上 ``<runs_dir>/<run>/<what>``（默认 ``best``）下载到本地 ``runs/<run>/``。
+
+    做法：先在 VM 上把目标目录连同 log.jsonl、args.json（若存在）打成一个 tar.gz，
+    下载到本地后解压，再删除本地压缩包。``--what last`` 可以下载带优化器状态的可续训 checkpoint。
+
+    处理步骤：
+        第 1 步（远程）：把 checkpoint 目录和日志打包成 /content/fetch_<run>_<what>.tar.gz；
+                         日志文件不存在时（例如训练刚开始）用 try/except 忽略；
+        第 2 步：下载到本地 runs/<run>/ 目录；
+        第 3 步：本地解压，然后删除压缩包。
+
+    举个例子：python scripts/colab_job.py fetch -s ajev --run sft1 --drive --what best
+        → 本地得到 runs/sft1/best/（模型权重、tokenizer、配置）、runs/sft1/log.jsonl、runs/sft1/args.json。
+    """
     src = f"{runs_dir(a.drive)}/{a.run}"
     tar_remote = f"/content/fetch_{a.run}_{a.what}.tar.gz"
     remote_python(a.session, f"""
@@ -159,10 +339,12 @@ def cmd_fetch(a) -> None:
                 except FileNotFoundError:
                     pass
     """)
+    # 第 2 步：下载。
     local_dir = os.path.join(ROOT, "runs", a.run)
     os.makedirs(local_dir, exist_ok=True)
     local_tar = os.path.join(local_dir, f"{a.what}.tar.gz")
     colab("download", "-s", a.session, tar_remote, local_tar)
+    # 第 3 步：解压并清理压缩包。
     with tarfile.open(local_tar) as t:
         t.extractall(local_dir)
     os.remove(local_tar)
@@ -170,14 +352,22 @@ def cmd_fetch(a) -> None:
 
 
 def cmd_stop(a) -> None:
+    """``stop`` 子命令：释放 VM。空闲的 VM 也会消耗额度，用完一定要停掉。"""
     colab("stop", "-s", a.session)
 
 
 def main() -> None:
+    """命令行入口：定义各子命令及其参数，然后分派给对应的 ``cmd_*`` 函数。
+
+    “子命令”就像 git 的 ``git commit`` / ``git push``：同一个脚本，第一个参数决定做什么。
+    argparse 的 ``add_subparsers`` 用来实现这种结构；``set_defaults(fn=...)`` 把处理函数
+    绑在子命令上，解析完参数后统一用 ``a.fn(a)`` 调用。
+    """
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, **kw):
+        """注册一个子命令：所有子命令都带 ``-s/--session``（默认会话名 ajev），并绑定处理函数。"""
         p = sub.add_parser(name, **kw)
         p.add_argument("-s", "--session", default="ajev")
         p.set_defaults(fn=fn)
@@ -187,11 +377,13 @@ def main() -> None:
     p.add_argument("--gpu", default="T4")
     p.add_argument("--data", help="local data dir to upload (e.g. data/build)")
     add("drive", cmd_drive)
+    # train / status / fetch 都需要指定运行名，并可选择运行目录是否放在 Drive 上。
     for name, fn in (("train", cmd_train), ("status", cmd_status), ("fetch", cmd_fetch)):
         p = add(name, fn)
         p.add_argument("--run", required=True)
         p.add_argument("--drive", action="store_true", help=f"run dir under {DRIVE_RUNS}")
     sub.choices["train"].add_argument("--data-dir", default="data/build")
+    # REMAINDER：把剩下的所有参数原样收集起来，转发给 ajev.train.train。
     sub.choices["train"].add_argument("train_args", nargs=argparse.REMAINDER,
                                       help="extra args for ajev.train.train (after --)")
     sub.choices["status"].add_argument("--lines", type=int, default=15)
@@ -199,6 +391,7 @@ def main() -> None:
     add("stop", cmd_stop)
 
     a = ap.parse_args()
+    # REMAINDER 会把分隔用的 "--" 一起收进来，这里去掉它。
     if getattr(a, "train_args", None) and a.train_args[0] == "--":
         a.train_args = a.train_args[1:]
     a.fn(a)
