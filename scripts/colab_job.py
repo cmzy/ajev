@@ -131,6 +131,52 @@ def remote_python(session: str, code: str, retries: int = 3) -> None:
         os.unlink(path)
 
 
+def upload_file(session: str, local: str, remote: str, chunk_mb: int = 40) -> None:
+    """把本地文件上传到 VM；大文件分块上传后在 VM 上拼回，并核对 SHA-256。
+
+    为什么要分块：Colab 的上传接口对单个文件的大小有限制，约 100 MB 的数据包会直接返回 500 错误
+    （第二版数据压缩后就有这么大）。做法：
+        第 1 步：本地按 chunk_mb 切成若干块，逐块上传为 <remote>.part000、.part001……；
+        第 2 步：在 VM 上按顺序拼接成 <remote>，删除分块；
+        第 3 步：在 VM 上计算拼好的文件的 SHA-256，和本地的比较，不一致就报错。
+    小于 chunk_mb 的文件直接整个上传。
+    """
+    import hashlib
+
+    size = os.path.getsize(local)
+    if size <= chunk_mb * 2**20:
+        colab("upload", "-s", session, local, remote)
+        return
+    h = hashlib.sha256()
+    parts = []
+    with open(local, "rb") as f:
+        k = 0
+        while chunk := f.read(chunk_mb * 2**20):
+            h.update(chunk)
+            part_local = os.path.join(tempfile.gettempdir(), f"upload.part{k:03d}")
+            with open(part_local, "wb") as out:
+                out.write(chunk)
+            part_remote = f"{remote}.part{k:03d}"
+            colab("upload", "-s", session, part_local, part_remote)
+            os.remove(part_local)
+            parts.append(part_remote)
+            k += 1
+    remote_python(session, f"""
+        import hashlib, os
+        parts = {parts!r}
+        h = hashlib.sha256()
+        with open({remote!r}, "wb") as out:
+            for p in parts:
+                data = open(p, "rb").read()
+                h.update(data)
+                out.write(data)
+                os.remove(p)
+        if h.hexdigest() != {h.hexdigest()!r}:
+            raise SystemExit("SHA-256 mismatch after reassembling {remote}")
+        print("reassembled", {remote!r}, os.path.getsize({remote!r}), "bytes, sha256 ok")
+    """)
+
+
 def make_tar(paths: list[str], base: str, name: str) -> str:
     """把 ``base`` 下的若干路径打包成系统临时目录中的 ``name``（tar.gz），返回压缩包路径。
 
@@ -180,7 +226,7 @@ def cmd_up(a) -> None:
     colab("upload", "-s", a.session, code, "/content/ajev_code.tar.gz")
     if a.data:
         data = make_tar([os.path.relpath(a.data, ROOT)], ROOT, "ajev_data.tar.gz")
-        colab("upload", "-s", a.session, data, "/content/ajev_data.tar.gz")
+        upload_file(a.session, data, "/content/ajev_data.tar.gz")
     # 第 3 步（远程执行）：解压并删除压缩包；Colab 已预装 torch / transformers / datasets，
     # 用 --no-deps 只安装 ajev 本身，避免 pip 改动 Colab 自带的依赖版本。
     remote_python(a.session, f"""
