@@ -170,6 +170,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--val-limit", type=int, default=1500)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume-from", help="resume from this checkpoint directory instead of {out}/last "
+                                          "(e.g. an earlier, healthy checkpoint)")
+    ap.add_argument("--skip-gnorm", type=float, default=100.0,
+                    help="skip the update when the pre-clip gradient norm exceeds this (0 = never skip)")
     args = ap.parse_args(argv)
 
     # ---- 第 1 步：设备、模型、LoRA（或从 last 续训）----
@@ -177,7 +181,8 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     last_dir, best_dir = os.path.join(args.out, "last"), os.path.join(args.out, "best")
-    resume_dir = find_resumable(last_dir, NEEDED)
+    # --resume-from：从指定的（例如更早、更健康的）checkpoint 续训，而不是 {out}/last。
+    resume_dir = args.resume_from or find_resumable(last_dir, NEEDED)
     tok = load_tokenizer(args.model)
     model = load_base_model(args.model, dtype)
     model.config.use_cache = False  # 训练时不需要生成用的 KV 缓存
@@ -234,6 +239,14 @@ def main(argv: list[str] | None = None) -> None:
         step, micro_total, best = st["step"], st["micro_total"], st["best"]
         epoch, epoch_micro = st["epoch"], st["epoch_micro"]
         print(f"[lm-train] resumed from {resume_dir} at step {step}", flush=True)
+        # 续训时允许修改峰值学习率：调度器的状态里存着旧的“基础学习率”，这里换成 --lr，
+        # 当前学习率按新基础学习率 × 当前步的调度系数重新计算。
+        # （第一次正式训练在 1e-4 下出现梯度尖峰、loss 抬升，就是靠这个降到 3e-5 后从健康的 checkpoint 接着训。）
+        if abs(sched.base_lrs[0] - args.lr) > 1e-12:
+            print(f"[lm-train] peak lr {sched.base_lrs[0]:.2e} -> {args.lr:.2e}", flush=True)
+            sched.base_lrs = [args.lr] * len(sched.base_lrs)
+            for g in optim.param_groups:
+                g["initial_lr"], g["lr"] = args.lr, args.lr * lr_lambda(step)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "args.json"), "w") as f:
@@ -298,7 +311,7 @@ def main(argv: list[str] | None = None) -> None:
     def fresh() -> dict:
         return {"loss": 0.0, "ce": 0.0, "n": 0, "rps": 0.0, "n_score": 0, "cons": 0.0, "n_cons": 0, "steps": 0}
 
-    t0, running, window_n, checked_grads = time.time(), fresh(), 0, False
+    t0, running, window_n, checked_grads, skipped = time.time(), fresh(), 0, False, 0
     while step < total_steps:
         trainset.epoch = epoch
         loader = DataLoader(trainset, batch_sampler=epoch_batches(epoch)[epoch_micro:], collate_fn=collate_fn,
@@ -344,7 +357,13 @@ def main(argv: list[str] | None = None) -> None:
                     p.grad.mul_(ref_n / window_n)
             window_n = 0
             gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optim.step()
+            # 梯度尖峰保护：裁剪前的梯度范数异常大，说明这一批把模型推向了损失曲面很陡的地方。
+            # 裁剪虽然限制了步长，但方向往往不可靠，连续几次就可能把模型推坏（第一次训练就是这样）。
+            # 这里直接放弃这一步的更新（学习率调度照常前进），并计数记入日志。
+            if args.skip_gnorm and float(gnorm) > args.skip_gnorm:
+                skipped += 1
+            else:
+                optim.step()
             optim.zero_grad(set_to_none=True)
             sched.step()
             step += 1
@@ -356,7 +375,8 @@ def main(argv: list[str] | None = None) -> None:
                      "loss": round(rn["loss"] / max(1, rn["n"]), 4), "ce": round(rn["ce"] / max(1, rn["n"]), 4),
                      "rps": round(rn["rps"] / max(1, rn["n_score"]), 4),
                      "cons": round(rn["cons"] / max(1, rn["n_cons"]), 4),
-                     "mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1) if device.type == "cuda" else 0})
+                     "mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1) if device.type == "cuda" else 0,
+                     "skipped": skipped})
                 running, t0 = fresh(), time.time()
             if step % args.eval_every == 0:
                 run_eval()
