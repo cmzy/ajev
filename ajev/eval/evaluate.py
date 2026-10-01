@@ -63,9 +63,11 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True)
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--predictor", choices=["uniform", "random", "prior"])
+    src.add_argument("--predictor", choices=["uniform", "random", "prior", "model"])
     src.add_argument("--predictions")
     ap.add_argument("--train", help="train JSONL (needed by --predictor prior)")
+    ap.add_argument("--checkpoint", help="model directory (needed by --predictor model)")
+    ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
     args = ap.parse_args(argv)
@@ -79,9 +81,20 @@ def main(argv: list[str] | None = None) -> None:
             if not args.train:
                 raise SystemExit("--predictor prior needs --train")
             predictor = PriorPredictor(read_jsonl(args.train))
+        elif args.predictor == "model":
+            if not args.checkpoint:
+                raise SystemExit("--predictor model needs --checkpoint")
+            from ajev.model.predictor import EncoderPredictor
+
+            predictor = EncoderPredictor(args.checkpoint)
         else:
             predictor = UniformPredictor() if args.predictor == "uniform" else RandomPredictor()
         preds = predictor.predict(decisions)
+
+    if args.save_predictions:
+        with open(args.save_predictions, "w", encoding="utf-8") as f:
+            for d, p in zip(decisions, preds):
+                f.write(json.dumps({"id": d.id, "probs": [round(x, 6) for x in p]}) + "\n")
 
     report = evaluate(decisions, preds)
     if args.shuffle_check and predictor is not None:

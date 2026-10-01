@@ -7,6 +7,7 @@ Outputs:
     train.jsonl         public train splits (capped per source) + typed-decisions train
     val.jsonl           public eval splits, first --eval-cap per source (model selection, temperature fit)
     test_public.jsonl   public eval splits, next --eval-cap per source (per-type / per-language report)
+    val_typed.jsonl     typed-decisions train, held-out 10% of states (in-domain model selection)
     test_typed.jsonl    typed-decisions test, 2,000 decisions (headline benchmark)
     stats.json          counts per file / source / type / language
 """
@@ -55,6 +56,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--zh-instr-prob", type=float, default=0.2,
                     help="probability an English source gets a Chinese instruction (cross-lingual)")
     ap.add_argument("--no-typed-decisions", action="store_true")
+    ap.add_argument("--typed-val-frac", type=float, default=0.1,
+                    help="fraction of typed-decisions train states held out as val_typed")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
@@ -67,6 +70,7 @@ def main(argv: list[str] | None = None) -> None:
     train: list[Decision] = []
     val: list[Decision] = []
     test_public: list[Decision] = []
+    val_typed: list[Decision] = []
     test_typed: list[Decision] = []
 
     for name in names:
@@ -80,12 +84,16 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.no_typed_decisions:
         print("[build] typed_decisions", flush=True)
-        train += list(iter_typed_decisions("train"))
+        typed_train = list(iter_typed_decisions("train"))
+        groups = sorted({d.group for d in typed_train})
+        held = set(random.Random(args.seed).sample(groups, int(len(groups) * args.typed_val_frac)))
+        train += [d for d in typed_train if d.group not in held]
+        val_typed = [d for d in typed_train if d.group in held]
         test_typed = list(iter_typed_decisions("test"))
 
     # Contamination guard: drop train items whose state shows up in any held-out file,
     # then exact-duplicate (state, instructions) pairs within train.
-    held_states = {_state_key(d) for d in val + test_public + test_typed}
+    held_states = {_state_key(d) for d in val + test_public + val_typed + test_typed}
     seen: set[str] = set()
     clean: list[Decision] = []
     dropped = Counter()
@@ -108,7 +116,7 @@ def main(argv: list[str] | None = None) -> None:
     rng.shuffle(train)
 
     os.makedirs(args.out, exist_ok=True)
-    files = {"train": train, "val": val, "test_public": test_public, "test_typed": test_typed}
+    files = {"train": train, "val": val, "test_public": test_public, "val_typed": val_typed, "test_typed": test_typed}
     for fname, ds in files.items():
         if ds:
             write_jsonl(os.path.join(args.out, f"{fname}.jsonl"), ds)
