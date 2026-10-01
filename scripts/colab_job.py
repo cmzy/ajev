@@ -313,42 +313,72 @@ def cmd_status(a) -> None:
 
 
 def cmd_fetch(a) -> None:
-    """``fetch`` 子命令：把 VM 上 ``<runs_dir>/<run>/<what>``（默认 ``best``）下载到本地 ``runs/<run>/``。
+    """``fetch`` 子命令：把 VM 上 ``<runs_dir>/<run>/<what>``（默认 ``best``）下载到本地 ``runs/<run>/``，并校验完整性。
 
-    做法：先在 VM 上把目标目录连同 log.jsonl、args.json（若存在）打成一个 tar.gz，
-    下载到本地后解压，再删除本地压缩包。``--what last`` 可以下载带优化器状态的可续训 checkpoint。
+    为什么要校验：我们吃过亏——Google Drive 在后台异步上传大文件，VM 被回收时新版本没传完，
+    云端留下的是旧文件，看起来“保存成功”，实际权重是错的。所以现在只相信“下载到本机并核对过哈希”的副本。
 
     处理步骤：
-        第 1 步（远程）：把 checkpoint 目录和日志打包成 /content/fetch_<run>_<what>.tar.gz；
-                         日志文件不存在时（例如训练刚开始）用 try/except 忽略；
-        第 2 步：下载到本地 runs/<run>/ 目录；
-        第 3 步：本地解压，然后删除压缩包。
+        第 1 步（远程）：把 checkpoint 目录和日志打包成 tar（不压缩：模型权重几乎压不动，压缩只会浪费时间），
+                         并计算整个 tar 的 SHA-256 写进同名 .sha256 文件；
+        第 2 步：下载 tar 和 .sha256 到本地；
+        第 3 步：本地重新计算 tar 的 SHA-256，与远程的比较；不一致就报错，绝不使用这份文件；
+        第 4 步：先解压到临时目录 runs/<run>/.incoming，再用改名替换旧的 runs/<run>/<what>，
+                 这样本地任何时刻都只有完整的旧版本或完整的新版本。
 
-    举个例子：python scripts/colab_job.py fetch -s ajev --run sft1 --drive --what best
-        → 本地得到 runs/sft1/best/（模型权重、tokenizer、配置）、runs/sft1/log.jsonl、runs/sft1/args.json。
+    举个例子：python scripts/colab_job.py fetch -s ajev --run sft2 --what best
+        → 本地得到 runs/sft2/best/（权重、tokenizer、配置）以及 runs/sft2/log.jsonl、runs/sft2/args.json。
     """
+    import hashlib
+    import shutil
+
     src = f"{runs_dir(a.drive)}/{a.run}"
-    tar_remote = f"/content/fetch_{a.run}_{a.what}.tar.gz"
+    tar_remote = f"/content/fetch_{a.run}_{a.what}.tar"
+    # 第 1 步（远程）：打包并计算哈希。
     remote_python(a.session, f"""
-        import tarfile
-        with tarfile.open({tar_remote!r}, "w:gz") as t:
+        import hashlib, tarfile
+        with tarfile.open({tar_remote!r}, "w") as t:
             t.add({src!r} + "/" + {a.what!r}, arcname={a.what!r})
             for f in ("log.jsonl", "args.json"):
                 try:
                     t.add({src!r} + "/" + f, arcname=f)
                 except FileNotFoundError:
                     pass
+        h = hashlib.sha256()
+        with open({tar_remote!r}, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 24), b""):
+                h.update(chunk)
+        open({tar_remote!r} + ".sha256", "w").write(h.hexdigest())
+        print("remote sha256", h.hexdigest()[:16])
     """)
-    # 第 2 步：下载。
+    # 第 2 步：下载 tar 和哈希文件。
     local_dir = os.path.join(ROOT, "runs", a.run)
     os.makedirs(local_dir, exist_ok=True)
-    local_tar = os.path.join(local_dir, f"{a.what}.tar.gz")
+    local_tar = os.path.join(local_dir, f"{a.what}.tar")
     colab("download", "-s", a.session, tar_remote, local_tar)
-    # 第 3 步：解压并清理压缩包。
+    colab("download", "-s", a.session, tar_remote + ".sha256", local_tar + ".sha256")
+    # 第 3 步：本地校验。
+    h = hashlib.sha256()
+    with open(local_tar, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    expected = open(local_tar + ".sha256").read().strip()
+    if h.hexdigest() != expected:
+        raise SystemExit(f"SHA-256 mismatch for {local_tar}: local {h.hexdigest()[:16]} != remote {expected[:16]}")
+    # 第 4 步：解压到临时目录，再整体替换。
+    incoming = os.path.join(local_dir, ".incoming")
+    shutil.rmtree(incoming, ignore_errors=True)
     with tarfile.open(local_tar) as t:
-        t.extractall(local_dir)
+        t.extractall(incoming)
+    target = os.path.join(local_dir, a.what)
+    shutil.rmtree(target, ignore_errors=True)
+    os.rename(os.path.join(incoming, a.what), target)
+    for f in os.listdir(incoming):  # log.jsonl / args.json
+        os.replace(os.path.join(incoming, f), os.path.join(local_dir, f))
+    shutil.rmtree(incoming)
     os.remove(local_tar)
-    print("fetched ->", local_dir)
+    os.remove(local_tar + ".sha256")
+    print(f"fetched + verified (sha256 {expected[:16]}) ->", target)
 
 
 def cmd_stop(a) -> None:
