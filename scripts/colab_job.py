@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REMOTE = "/content/AJev"
@@ -38,12 +39,20 @@ def colab(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["colab", *args], check=check)
 
 
-def remote_python(session: str, code: str) -> None:
+def remote_python(session: str, code: str, retries: int = 3) -> None:
+    """Run code on the VM. The kernel websocket sometimes drops ("Connection was lost"),
+    typically on the first call after a while; retry a few times."""
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(textwrap.dedent(code))
         path = f.name
     try:
-        colab("exec", "-s", session, "-f", path)
+        for attempt in range(1, retries + 1):
+            r = colab("exec", "-s", session, "-f", path, check=False)
+            if r.returncode == 0:
+                return
+            print(f"[colab_job] exec failed (attempt {attempt}/{retries})", flush=True)
+            time.sleep(5)
+        raise SystemExit("colab exec kept failing")
     finally:
         os.unlink(path)
 
@@ -108,6 +117,11 @@ def cmd_train(a) -> None:
     remote_python(a.session, f"""
         import os, subprocess
         os.makedirs({out!r}, exist_ok=True)
+        pid_file = {out!r} + "/pid"
+        if os.path.exists(pid_file):
+            stat = "/proc/" + open(pid_file).read().strip() + "/stat"
+            if os.path.exists(stat) and open(stat).read().split()[2] != "Z":
+                raise SystemExit("training already running for this run dir; not starting another")
         log = open({out!r} + "/stdout.log", "a")
         p = subprocess.Popen({cmd!r}, shell=True, cwd="{REMOTE}", stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True)
