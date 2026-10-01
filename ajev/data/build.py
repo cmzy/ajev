@@ -62,9 +62,14 @@ import sys
 from collections import Counter
 from itertools import islice
 
-from ajev.data.sources import SOURCES
+from ajev.data.more_sources import MORE_SOURCES
+from ajev.data.sources import SOURCES as BASE_SOURCES
 from ajev.data.typed_decisions import iter_typed_decisions
 from ajev.schema import Decision, write_jsonl
+
+# 全部数据源 = 第一批（sources.py）+ 第二批（more_sources.py）。名字不能重复。
+SOURCES = {**BASE_SOURCES, **MORE_SOURCES}
+assert len(SOURCES) == len(BASE_SOURCES) + len(MORE_SOURCES), "duplicate source names"
 
 
 def _key(d: Decision) -> str:
@@ -135,7 +140,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--sources", default="all", help="comma-separated source names, or 'all'")
     ap.add_argument("--train-cap", type=int, default=3000, help="max train decisions per public source")
     ap.add_argument("--eval-cap", type=int, default=300, help="max decisions per source in val and in test_public")
-    ap.add_argument("--zh-cap-mult", type=float, default=2.0,
+    ap.add_argument("--zh-cap-mult", type=float, default=3.0,
                     help="multiply --train-cap for Chinese sources (target: 30-50%% Chinese in train)")
     ap.add_argument("--zh-instr-prob", type=float, default=0.2,
                     help="probability an English source gets a Chinese instruction (cross-lingual)")
@@ -164,9 +169,10 @@ def main(argv: list[str] | None = None) -> None:
     for name in names:
         src = SOURCES[name]
         print(f"[build] {name}: {src.path} {src.config or ''}", flush=True)
-        # 中文数据源只有 5 个，英文有 18 个；中文源的上限乘以 zh_cap_mult（默认 2），
-        # 把训练集中的中文比例拉到 30%~50% 的目标区间。
-        cap = int(args.train_cap * (args.zh_cap_mult if src.lang == "zh" else 1))
+        # 每个数据源的基础上限：有自己的 train_cap 就用它（例如 bev-decision 这种大数据源想多采），
+        # 否则用全局 --train-cap。中文数据源远少于英文，上限再乘以 zh_cap_mult（默认 3），
+        # 把训练集中的中文比例保持在 30% 以上。
+        cap = int((src.train_cap or args.train_cap) * (args.zh_cap_mult if src.lang == "zh" else 1))
         train += list(src.iter_decisions(src.train_split, cap, args.seed, args.zh_instr_prob))
         # 评测 split 一次取 2 × eval_cap 条：前一半进 val，剩下的进 test_public，两者互不重叠。
         # held 是生成器，islice 消费掉前 eval_cap 条后，list(held) 拿到的就是后面的部分。

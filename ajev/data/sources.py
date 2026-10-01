@@ -126,7 +126,7 @@ class Ctx:
 
 # 转换器类型：输入 (原始行, 行号, 上下文)，输出一个 Decision；返回 None 表示跳过该行。
 # Callable[[参数类型...], 返回类型] 是类型注解，表示“一个可以调用的函数”，只用于提示和阅读，不影响运行。
-Converter = Callable[[Row, int, Ctx], "Decision | None"]
+Converter = Callable[[Row, int, Ctx], "Decision | list[Decision] | None"]
 
 
 @dataclass
@@ -141,9 +141,18 @@ class Source:
         eval_split: 用来生成验证 / 测试数据的 split（build 时前一半进 val，后一半进 test_public）。
             有些数据集的 test split 没有公开标签，因此这里通常选 validation。
         lang: 数据（state）本身的语言，``"en"`` 或 ``"zh"``。
-        convert: 把一行原始数据转换为 Decision 的函数。
+        convert: 把一行原始数据转换为 Decision 的函数。可以返回一个 Decision、一个 Decision 列表
+            （一行原始数据产出多道题，比如一张客服工单同时问“分到哪个队列”和“优先级多高”），
+            或 None（跳过这一行）。
         label_field: 标签所在的字段名，用于推断 ``label_names``（类别名列表）。
         tags: 预留的标签字段，目前未使用。
+        data_files: 按文件加载时的 {split 名: 文件名}。个别数据集的各个文件列不一致
+            （例如 COLD 的 test.csv 多一列），整体加载会报错，只能逐个文件加载。
+        train_cap: 本数据源的训练采样上限；None 表示用 build.py 的全局 ``--train-cap``。
+            大数据源（如 bev-decision）想多采一些、小数据源想少采一些时用它。
+
+    split 名也可以写成“切片”形式，例如 ``"train[:90%]"`` / ``"train[90%:]"``：
+    有些数据集只有 train 一个 split，就用前 90% 训练、后 10% 做验证 / 测试。
     """
 
     name: str
@@ -156,11 +165,17 @@ class Source:
     label_field: str = "label"
     # 有些数据源只用于评测（例如 typed-decisions 的测试集在别处单独加载）。
     tags: list[str] = field(default_factory=list)
+    data_files: dict[str, str] | None = None
+    train_cap: int | None = None
 
     def load(self, split: str):
         """从 HF Hub（或本地缓存）加载指定 split。``datasets`` 延迟导入，避免只用 schema 时也要装它。"""
         from datasets import load_dataset
 
+        if self.data_files:
+            # 按文件加载：split 名是 data_files 的键；只加载这一个文件，避免列不一致的报错。
+            base = split.split("[")[0]
+            return load_dataset(self.path, data_files={base: self.data_files[base]}, split=split)
         return load_dataset(self.path, self.config, split=split)
 
     def iter_decisions(
@@ -190,6 +205,7 @@ class Source:
             第 2 步：推断类别名列表 label_names（整数标签 → 名字的对照表）；
             第 3 步：用 seed 打乱数据；
             第 4 步：逐行调用转换器，跳过返回 None 的行，校验后产出，直到达到 limit。
+                     转换器返回列表时（一行产出多道题），逐道产出，每道题都计入 limit。
         """
         # 第 1 步：加载数据。
         ds = self.load(split)
@@ -213,12 +229,16 @@ class Source:
         for i, row in enumerate(ds):
             if limit is not None and n >= limit:
                 break
-            d = self.convert(row, i, ctx)
-            if d is None:
+            out = self.convert(row, i, ctx)
+            if out is None:
                 continue
-            d.validate()
-            n += 1
-            yield d
+            # 统一成列表处理：单个 Decision 包成只有一个元素的列表。
+            for d in out if isinstance(out, list) else [out]:
+                if limit is not None and n >= limit:
+                    break
+                d.validate()
+                n += 1
+                yield d
 
 
 # ---- 通用构造函数：按题型生成 Decision -----------------------------------------------
