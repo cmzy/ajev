@@ -58,7 +58,6 @@ def create_app(base_model: str, adapter: str, device: str | None, max_state_toke
     from fastapi.responses import FileResponse
 
     from ajev.lm.predictor import LMPredictor, prompt_ids
-    from ajev.lm.prompt import MAX_OPTIONS
     from ajev.schema import decisions_from_jev, jev_answer
 
     import torch
@@ -107,8 +106,6 @@ def create_app(base_model: str, adapter: str, device: str | None, max_state_toke
                                            lang=detect_lang(body["state"], questions))
             for d in decisions:
                 d.validate()
-                if len(d.options) > MAX_OPTIONS:  # 选项用字母 A–Z 表示，最多 26 个
-                    raise ValueError(f"{d.meta['question_id']}: at most {MAX_OPTIONS} options, got {len(d.options)}")
         except (KeyError, TypeError, AttributeError, ValueError) as e:
             raise HTTPException(400, f"invalid question: {e}") from e
         # 第 3 步：推理（自动使用适配器里校准好的温度）。

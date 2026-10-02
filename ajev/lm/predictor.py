@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 
 import torch
 
@@ -189,20 +188,54 @@ class LMPredictor:
         self.max_state_tokens = max_state_tokens or DEFAULT_INFER_STATE_TOKENS
         self.temperatures = temperatures if temperatures is not None else cfg.get("temperatures", {})
         self.table, self.valid = letter_token_table(self.tok)
-        self.skipped = 0  # 选项超过 26 个、无法用字母表示的题数
+        self.knockout_per_group = 2  # 选项超过 26 个时，每组进入决赛的人数（见 ajev/lm/knockout.py）
 
     @torch.no_grad()
     def predict_logits(self, decisions: list[Decision]) -> list[list[float]]:
-        """每道题在各选项字母上的打分（logits）。选项超过 26 个的题无法处理，返回全 0（等于均匀分布）。"""
+        """每道题在各选项上的打分（logits）。
+
+        不超过 26 个选项：一次前向，直接读字母打分；
+        超过 26 个选项：分组淘汰（初赛 + 决赛，见 ajev/lm/knockout.py），返回合成后的对数概率。
+        """
+        narrow = [i for i, d in enumerate(decisions) if len(d.options) <= MAX_OPTIONS]
+        wide = [i for i, d in enumerate(decisions) if len(d.options) > MAX_OPTIONS]
+        out: list[list[float]] = [[0.0] * len(d.options) for d in decisions]
+        for i, lg in zip(narrow, self._letter_scores([decisions[i] for i in narrow])):
+            out[i] = lg
+        if wide:
+            for i, lg in zip(wide, self._knockout([decisions[i] for i in wide])):
+                out[i] = lg
+        return out
+
+    def _knockout(self, decisions: list[Decision]) -> list[list[float]]:
+        """分组淘汰：所有题的初赛一起分批计算，再把所有决赛一起计算（决赛仍超过 26 个时递归）。"""
+        from ajev.lm.knockout import combine, finalists, split_groups
+
+        plans, subs = [], []
+        for d in decisions:
+            groups = split_groups(len(d.options), MAX_OPTIONS)
+            plans.append((d, groups, len(subs)))
+            for gi, g in enumerate(groups):
+                subs.append(Decision(**{**d.__dict__, "id": f"{d.id}#g{gi}", "options": [d.options[o] for o in g],
+                                        "target": [1.0 / len(g)] * len(g)}))
+        group_scores = self._letter_scores(subs)
+        finals, idxs = [], []
+        for d, groups, s0 in plans:
+            f = finalists(groups, group_scores[s0: s0 + len(groups)], self.knockout_per_group)
+            idxs.append(f)
+            finals.append(Decision(**{**d.__dict__, "id": f"{d.id}#final", "options": [d.options[o] for o in f],
+                                      "target": [1.0 / len(f)] * len(f)}))
+        final_scores = self.predict_logits(finals)  # 递归：决赛超过 26 个选项时继续分组
+        return [combine(len(d.options), groups, group_scores[s0: s0 + len(groups)], f, fs)
+                for (d, groups, s0), f, fs in zip(plans, idxs, final_scores)]
+
+    @torch.no_grad()
+    def _letter_scores(self, decisions: list[Decision]) -> list[list[float]]:
+        """不超过 26 个选项的题：一次前向读字母打分。"""
         was_training = self.model.training
         self.model.eval()
         out: list[list[float]] = [[0.0] * len(d.options) for d in decisions]
-        todo = []
-        for i, d in enumerate(decisions):
-            if len(d.options) > MAX_OPTIONS:
-                self.skipped += 1
-                continue
-            todo.append((i, prompt_ids(self.tok, d, self.max_state_tokens)))
+        todo = [(i, prompt_ids(self.tok, d, self.max_state_tokens)) for i, d in enumerate(decisions)]
         # 按长度排序后按 token 预算分批：长度相近的放一起，补齐浪费最少。
         todo.sort(key=lambda x: len(x[1]))
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
@@ -225,9 +258,6 @@ class LMPredictor:
         flush()
         if was_training:
             self.model.train()
-        if self.skipped:
-            print(f"[lm] {self.skipped} decisions have more than {MAX_OPTIONS} options; scored as uniform",
-                  file=sys.stderr)
         return out
 
     def predict(self, decisions: list[Decision]) -> list[list[float]]:

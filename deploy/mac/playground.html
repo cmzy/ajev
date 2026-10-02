@@ -188,7 +188,7 @@ function syncHints(el) {
   } else if (t === "choice") {
     ins.placeholder = "例如：这条工单属于哪一类？";
     cl.textContent = "选项（每行一个，格式：选项名: 描述）";
-    h.textContent = "2–26 个选项。返回每个选项的概率。";
+    h.textContent = "2–255 个选项（超过 26 个时自动分组淘汰，会慢一些）。返回每个选项的概率。";
   } else {
     ins.placeholder = "例如：客户有多生气？";
     cl.textContent = "等级（每行一个，从低到高）";
