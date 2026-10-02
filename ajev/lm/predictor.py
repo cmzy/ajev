@@ -31,7 +31,7 @@
 
 5. **材料太长时截短。** 材料按 token 数截到 ``max_state_tokens``（保留开头）。注意**训练和推理的截断长度是两回事**：
    训练时为了省显存截得比较短（例如 1,500），只作记录存在适配器配置的 ``train_max_state_tokens`` 里；
-   推理时默认放宽到 ``DEFAULT_INFER_STATE_TOKENS``（8,000），尽量让模型看到完整材料。
+   推理时默认放宽到 ``DEFAULT_INFER_STATE_TOKENS``（16,384，与训练上限一致），尽量让模型看到完整材料。
    我们吃过这个亏：最初推理沿用了训练的 1,500，长政策 / 多跳推理题的关键证据被截掉，
    JevBench 上材料超过 1,500 token 的 37 道题准确率只有 0.35，被误判成“LoRA 损害了推理能力”。
 """
@@ -49,8 +49,8 @@ from ajev.schema import Decision
 
 # LoRA 适配器目录里的 AJev 配置文件：基座模型名、训练时的材料截断长度、训练步数、校准温度。
 LM_CONFIG = "ajev_lm_config.json"
-# 推理时材料的默认截断长度（token）。Gemma 4 支持 256K 上下文，8,000 足以覆盖我们用到的评测集。
-DEFAULT_INFER_STATE_TOKENS = 8000
+# 推理时材料的默认截断长度（token）。Gemma 4 支持 256K 上下文；16K 与 gemma_lora2 的训练上限一致，足以覆盖我们用到的评测集。
+DEFAULT_INFER_STATE_TOKENS = 16384
 
 
 def load_base_model(model_id: str, dtype: torch.dtype = torch.bfloat16):

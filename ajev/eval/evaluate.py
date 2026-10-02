@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> None:
                                        "e.g. google/gemma-4-12B-it")
     ap.add_argument("--lm-adapter", help="LoRA adapter directory for --predictor lm (default: zero-shot)")
     ap.add_argument("--lm-max-state-tokens", type=int, default=None,
-                    help="truncate the state to this many tokens at inference (default: 8000)")
+                    help="truncate the state to this many tokens at inference (default: 16384)")
     ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
