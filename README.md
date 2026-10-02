@@ -70,10 +70,25 @@ uv run python -m ajev.eval.evaluate --data data/build/test_typed.jsonl --predict
 | 按训练集答案频率猜（本仓库基线） | 0.479 |
 | AJev sft2（第一版数据，8.6 万题） | 0.7185 |
 | AJev sft3（第二版数据，20 万题） | 0.7260 |
-| **AJev sft4**（修复数据问题 + typed-decisions 训练题 ×3） | **0.7745** |
+| AJev sft4（修复数据问题 + typed-decisions 训练题 ×3） | 0.7745 |
+| **AJev Gemma 4 12B + LoRA**（gemma_lora1b） | **0.7825** |
 | TypeSafe Jev | 0.727 |
 | Laya（421M） | 0.766 |
 | Verdict 2.0（151M） | 0.771 |
+
+## 两条路线的完整对比（测试集 / 外部评测）
+
+| 评测 | sft4（mmBERT 3 亿，训练过） | Gemma 4 12B 零样本 | **Gemma 4 12B + LoRA**（gemma_lora1b） | 其他开源 / 闭源 |
+|---|---|---|---|---|
+| typed-decisions 测试集 | 0.774 | 0.695 | **0.783** | Laya 0.766，Verdict 2.0 0.771，Jev 0.727 |
+| JevBench 公开集（231） | 0.584 | **0.857** | 0.801 | Winnow-12B 0.853，Jev 0.857 |
+| Kev transfer-v9（1,264） | 0.541 | 0.747 | **0.764** | Kev-9B 0.822（新数据源），Winnow 0.815（clean），Jev 0.870 |
+| eikos heldout（1,190） | 0.457 | **0.929** | 0.924 | — |
+
+- 外部评测用 `python -m ajev.eval.external` 生成（见该模块说明），与训练集的材料重合为 0。
+- Gemma + LoRA：33,700 道题（`ajev/lm/subset.py`），1 个 epoch，lr 3e-5（1e-4 时出现梯度尖峰、loss 抬升，
+  改为从第 200 步以 3e-5 续训），梯度范数 > 100 的更新被跳过（约 5.6%），训练后按题型做温度校准。
+- 代价：JevBench hard 档从零样本的 0.75 降到 0.60（严格规则判断变差），是下一轮要解决的问题。
 
 ## 部署到 MacBook（Apple 芯片，如 M4）
 
