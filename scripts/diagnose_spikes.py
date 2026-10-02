@@ -5,7 +5,8 @@
 
 原理：训练的分批是**确定的**——由题目长度、``--max-tokens``、``--batch-size`` 和随机种子决定
 （ajev/train/train.py 的 ``token_budget_batches``）。只要用同样的分词器和参数重算一遍，就能知道第 N 步
-具体用了哪几道题。第 N 个优化器步对应第 (N-1)×grad_accum … N×grad_accum-1 个 micro-batch（只训 1 个 epoch 时）。
+具体用了哪几道题。第 N 个优化器步对应第 (N-1)×grad_accum … N×grad_accum-1 个 micro-batch（只训 1 个 epoch 时）；
+固定题数分批（``decisions_per_step``）时直接对应计划表里的第 N 步。
 
 训练日志每 10 步记一条，包含**该步**的梯度范数 ``gnorm`` 和**累计**被跳过的步数 ``skipped``，所以有两种分析：
 
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ajev.lm.predictor import load_tokenizer, prompt_ids  # noqa: E402
 from ajev.lm.prompt import MAX_OPTIONS  # noqa: E402
+from ajev.lm.train_utils import fixed_count_steps  # noqa: E402
 from ajev.schema import read_jsonl  # noqa: E402
 from ajev.train.train import token_budget_batches  # noqa: E402
 
@@ -56,10 +58,17 @@ def main() -> None:
         train = [d for d in train if len(tok.encode(d.state, add_special_tokens=False)) <= max_state]
     state_len = [len(tok.encode(d.state, add_special_tokens=False)) for d in train]
     lengths = [len(prompt_ids(tok, d, max_state)) for d in train]
-    batches = token_budget_batches(lengths, args["max_tokens"], args["batch_size"], seed=args["seed"] * 1000)
+    if args.get("decisions_per_step"):
+        # 固定题数分批（gemma_lora2 之后）：第 N 步就是计划表里的第 N 个步。
+        steps = fixed_count_steps(lengths, args["decisions_per_step"], args["max_tokens"], args["batch_size"],
+                                  seed=args["seed"] * 1000)
+        plan = [[i for mb in st for i in mb] for st in steps]
+    else:
+        batches = token_budget_batches(lengths, args["max_tokens"], args["batch_size"], seed=args["seed"] * 1000)
+        plan = [[i for mb in batches[s: s + accum] for i in mb] for s in range(0, len(batches), accum)]
 
     def step_items(step: int) -> list[int]:
-        return [i for mb in batches[(step - 1) * accum: step * accum] for i in mb]
+        return plan[step - 1] if step <= len(plan) else []
 
     def describe(idx: list[int]) -> dict:
         n = len(idx)

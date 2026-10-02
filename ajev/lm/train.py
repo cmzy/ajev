@@ -34,12 +34,20 @@
 4. **保存的只是适配器**
    checkpoint 里只有 LoRA 的小矩阵（几百 MB）和它的优化器状态，基座模型不用存（推理时从 HF 下载原版，再把适配器加上去）。
 
-5. **材料长度：超长剔除，不截断**（``--max-state-tokens 4096 --over-limit drop``，原因见第 2 步的注释）。
+5. **材料长度：超长剔除，不截断**（``--max-state-tokens 16384 --over-limit drop``，原因见第 2 步的注释）。
 
-6. **梯度尖峰的处理与记录**：裁剪前梯度范数超过 ``--skip-gnorm`` 的更新被跳过；同时把这一步涉及的题的来源分布、
-   损失最大的 5 道题写进日志（``"skipped_update": true``），方便事后排查是哪类数据在制造尖峰。
+6. **固定每步题数**（``--decisions-per-step 32``）：每个优化器步正好 32 道随机混合长短的题，步内按 token 预算
+   切小批次做梯度累积。原来“每个按 token 装满的小批次就更新一次”会让长题被放大好几倍、并制造梯度尖峰，
+   原理见 ajev/lm/train_utils.py。设为 0 时退回旧的分批方式（``--grad-accum`` 个小批次更新一次）。
 
-其余（软标签 CE、打分题 RPS、打乱选项一致性、每道题权重相同、按 token 预算分批、原子保存与断点续训）
+7. **梯度尖峰的处理与记录**：裁剪前梯度范数超过最近 50 个正常步中位数的 ``--skip-gnorm-ratio`` 倍（默认 10），
+   或超过绝对上限 ``--skip-gnorm``（默认 1000），或是 NaN / inf，就跳过这一步的更新；同时把这一步涉及的题的
+   来源分布、损失最大的 5 道题写进日志（``"skipped_update": true``），方便事后排查。
+
+8. **打分题的序数平滑**（``--ordinal-smoothing 0.2``）：只有一个评分者的打分类数据源（Feedback-Collection、
+   UltraFeedback 中文版、HelpSteer2），one-hot 标签改成“正确等级 0.8、相邻等级分 0.2”，原理见 ajev/lm/train_utils.py。
+
+其余（软标签 CE、打分题 RPS、打乱选项一致性、每道题权重相同、原子保存与断点续训）
 与 mmBERT 训练完全相同，原理见 ajev/train/train.py 的说明。
 """
 
@@ -71,6 +79,7 @@ from ajev.lm.predictor import (
 from ajev.lm.prompt import MAX_OPTIONS
 from ajev.schema import Decision, read_jsonl
 from ajev.train.losses import rps, smooth, soft_ce, symmetric_kl, unpermute
+from ajev.lm.train_utils import ORDINAL_SMOOTH_SOURCES, SpikeGuard, fixed_count_steps, flatten_steps, ordinal_smooth
 from ajev.train.train import META_FILE, STATE_FILE, find_resumable, token_budget_batches
 
 # 一个完整的 LoRA checkpoint 必须包含的文件（配置文件放第一个，完整性检查从它读取 step）。
@@ -166,13 +175,21 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-steps", type=int, default=0, help="optimizer steps; overrides --epochs when > 0")
     ap.add_argument("--batch-size", type=int, default=16, help="max decisions per micro-batch")
     ap.add_argument("--max-tokens", type=int, default=12288, help="max padded tokens per micro-batch and view")
-    ap.add_argument("--grad-accum", type=int, default=1)
-    ap.add_argument("--max-state-tokens", type=int, default=4096,
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="micro-batches per update; only used when --decisions-per-step is 0")
+    ap.add_argument("--decisions-per-step", type=int, default=32,
+                    help="exactly this many randomly mixed decisions per optimizer step, split into token-budget "
+                         "micro-batches for gradient accumulation (0 = old behaviour: one update per "
+                         "--grad-accum token-budget micro-batches)")
+    ap.add_argument("--max-state-tokens", type=int, default=16384,
                     help="state length limit (tokens) during training")
     ap.add_argument("--over-limit", choices=["drop", "truncate"], default="drop",
                     help="what to do with decisions whose state exceeds --max-state-tokens: drop them (default; "
                          "a truncated state may no longer contain the evidence its label relies on) or truncate")
     ap.add_argument("--label-smoothing", type=float, default=0.05)
+    ap.add_argument("--ordinal-smoothing", type=float, default=0.2,
+                    help="for one-hot score decisions from single-rater sources " + ",".join(ORDINAL_SMOOTH_SOURCES)
+                         + ": keep 1-eps on the gold level and spread eps over the adjacent levels (0 = off)")
     ap.add_argument("--rps-weight", type=float, default=0.5)
     ap.add_argument("--consistency-weight", type=float, default=0.5)
     ap.add_argument("--no-grad-ckpt", action="store_true")
@@ -183,8 +200,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume-from", help="resume from this checkpoint directory instead of {out}/last "
                                           "(e.g. an earlier, healthy checkpoint)")
-    ap.add_argument("--skip-gnorm", type=float, default=100.0,
-                    help="skip the update when the pre-clip gradient norm exceeds this (0 = never skip)")
+    ap.add_argument("--skip-gnorm", type=float, default=1000.0,
+                    help="absolute cap: skip the update when the pre-clip gradient norm exceeds this (0 = no cap)")
+    ap.add_argument("--skip-gnorm-ratio", type=float, default=10.0,
+                    help="skip the update when the pre-clip gradient norm exceeds this many times the median of "
+                         "the last 50 accepted steps (0 = off); NaN / inf gradients are always skipped")
     args = ap.parse_args(argv)
 
     # ---- 第 1 步：设备、模型、LoRA（或从 last 续训）----
@@ -229,21 +249,40 @@ def main(argv: list[str] | None = None) -> None:
         train = kept
         print(f"[lm-train] dropped {sum(dropped.values())} decisions with state > {args.max_state_tokens} tokens: "
               f"{dict(dropped.most_common())}", flush=True)
+    # 只有一个评分者的打分题：one-hot 标签做序数平滑（原理见 ajev/lm/train_utils.py 第 3 条）。
+    if args.ordinal_smoothing > 0:
+        n_smooth = 0
+        for d in train:
+            if d.type == "score" and d.source in ORDINAL_SMOOTH_SOURCES and max(d.target) >= 1.0 - 1e-9:
+                d.target = ordinal_smooth(d.target, args.ordinal_smoothing)
+                n_smooth += 1
+        print(f"[lm-train] ordinal smoothing {args.ordinal_smoothing} applied to {n_smooth} one-hot score decisions",
+              flush=True)
     vals = {os.path.basename(p).removesuffix(".jsonl"): read_jsonl(p) for p in args.val}
     if args.val_limit:
         vals = {k: random.Random(args.seed).sample(v, min(args.val_limit, len(v))) for k, v in vals.items()}
     print(f"[lm-train] tokenizing {len(train)} prompts for length bucketing", flush=True)
     lengths = [len(prompt_ids(tok, d, args.max_state_tokens)) for d in train]
-    cache: dict[int, list[list[int]]] = {}
+    cache: dict[int, tuple[list[list[int]], list[bool] | None]] = {}
 
-    def epoch_batches(epoch: int) -> list[list[int]]:
+    def epoch_plan(epoch: int) -> tuple[list[list[int]], list[bool] | None]:
+        """某个 epoch 的小批次列表，以及每个小批次是否是一步的最后一个（旧分批方式下为 None）。"""
         if epoch not in cache:
-            cache[epoch] = token_budget_batches(lengths, args.max_tokens, args.batch_size, seed=args.seed * 1000 + epoch)
+            seed = args.seed * 1000 + epoch
+            if args.decisions_per_step:
+                cache[epoch] = flatten_steps(fixed_count_steps(lengths, args.decisions_per_step, args.max_tokens,
+                                                               args.batch_size, seed=seed))
+            else:
+                cache[epoch] = (token_budget_batches(lengths, args.max_tokens, args.batch_size, seed=seed), None)
         return cache[epoch]
 
+    def epoch_steps(epoch: int) -> int:
+        micro, ends = epoch_plan(epoch)
+        return sum(ends) if ends is not None else len(micro) // args.grad_accum
+
     full, frac = int(args.epochs), args.epochs - int(args.epochs)
-    total_micro = sum(len(epoch_batches(e)) for e in range(full)) + (int(len(epoch_batches(full)) * frac) if frac else 0)
-    total_steps = args.max_steps or max(1, total_micro // args.grad_accum)
+    total_steps = args.max_steps or max(1, sum(epoch_steps(e) for e in range(full))
+                                        + (int(epoch_steps(full) * frac) if frac else 0))
 
     # ---- 第 3 步：优化器与学习率调度（与 mmBERT 相同的 warmup + 余弦）----
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -255,6 +294,7 @@ def main(argv: list[str] | None = None) -> None:
         return max(0.0, 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup))))
 
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
+    guard = SpikeGuard(ratio=args.skip_gnorm_ratio, abs_limit=args.skip_gnorm)
     step, micro_total, epoch, epoch_micro, best = 0, 0, 0, 0, -1.0
     if resume_dir:
         st = torch.load(os.path.join(resume_dir, STATE_FILE), map_location="cpu", weights_only=False)
@@ -262,6 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         sched.load_state_dict(st["sched"])
         step, micro_total, best = st["step"], st["micro_total"], st["best"]
         epoch, epoch_micro = st["epoch"], st["epoch_micro"]
+        guard.load_state_dict(st.get("spike_guard", {}))
         print(f"[lm-train] resumed from {resume_dir} at step {step}", flush=True)
         # 续训时允许修改峰值学习率：调度器的状态里存着旧的“基础学习率”，这里换成 --lr，
         # 当前学习率按新基础学习率 × 当前步的调度系数重新计算。
@@ -294,7 +335,8 @@ def main(argv: list[str] | None = None) -> None:
                       indent=2)
         if with_state:
             torch.save({"optim": optim.state_dict(), "sched": sched.state_dict(), "step": step,
-                        "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro, "best": best},
+                        "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro, "best": best,
+                        "spike_guard": guard.state_dict()},
                        os.path.join(tmp, STATE_FILE))
             sizes = {f: os.path.getsize(os.path.join(tmp, f)) for f in os.listdir(tmp)}
             with open(os.path.join(tmp, META_FILE), "w") as f:
@@ -330,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
     # ---- 第 4 步：训练主循环（结构与 mmBERT 训练相同，见 ajev/train/train.py）----
     trainset = LMTrainSet(train, tok, args.max_state_tokens, args.seed, two_views=args.consistency_weight > 0)
     collate_fn = make_collate(tok.pad_token_id if tok.pad_token_id is not None else 0)
-    ref_n = args.batch_size * args.grad_accum
+    ref_n = args.decisions_per_step or args.batch_size * args.grad_accum
     model.train()
 
     def fresh() -> dict:
@@ -340,7 +382,8 @@ def main(argv: list[str] | None = None) -> None:
     window_items: list[tuple[str, str, float]] = []
     while step < total_steps:
         trainset.epoch = epoch
-        loader = DataLoader(trainset, batch_sampler=epoch_batches(epoch)[epoch_micro:], collate_fn=collate_fn,
+        micro_list, step_ends = epoch_plan(epoch)
+        loader = DataLoader(trainset, batch_sampler=micro_list[epoch_micro:], collate_fn=collate_fn,
                             num_workers=args.num_workers)
         for batch in loader:
             mask = batch["option_mask"].to(device)
@@ -375,9 +418,11 @@ def main(argv: list[str] | None = None) -> None:
             running["loss"] += loss.sum().item(); running["ce"] += ce.sum().item(); running["n"] += loss.size(0)
             running["rps"] += r.sum().item(); running["n_score"] += n_score
             running["cons"] += cons.sum().item(); running["n_cons"] += int(batch["b_index"].numel())
+            # 这个小批次是不是这一步的最后一个：固定题数分批看计划表，旧分批方式每 grad_accum 个小批次一步。
+            is_end = step_ends[epoch_micro] if step_ends is not None else (micro_total + 1) % args.grad_accum == 0
             micro_total += 1
             epoch_micro += 1
-            if micro_total % args.grad_accum:
+            if not is_end:
                 continue
             # 第 4 步：梯度归一化到“每道题平均” → 裁剪 → 更新。
             for p in params:
@@ -385,13 +430,15 @@ def main(argv: list[str] | None = None) -> None:
                     p.grad.mul_(ref_n / window_n)
             window_n = 0
             gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
-            # 梯度尖峰保护：裁剪前的梯度范数异常大，说明这一批把模型推向了损失曲面很陡的地方。
+            # 梯度尖峰保护：裁剪前的梯度范数相对最近的正常水平异常大，说明这一批把模型推向了损失曲面很陡的地方。
             # 裁剪虽然限制了步长，但方向往往不可靠，连续几次就可能把模型推坏（第一次训练就是这样）。
-            # 这里直接放弃这一步的更新（学习率调度照常前进），并计数记入日志。
-            if args.skip_gnorm and float(gnorm) > args.skip_gnorm:
+            # 这里直接放弃这一步的更新（学习率调度照常前进），并计数记入日志。判断规则见 SpikeGuard。
+            median_before = guard.median()
+            if guard.should_skip(float(gnorm)):
                 skipped += 1
                 top = sorted(window_items, key=lambda x: -x[2])[:5]
                 log({"skipped_update": True, "gnorm": round(float(gnorm), 1),
+                     "median_gnorm": round(median_before, 2) if median_before is not None else None,
                      "sources": dict(Counter(src for _, src, _ in window_items).most_common()),
                      "top_loss": [{"id": i, "source": src, "loss": round(v, 3)} for i, src, v in top]})
             else:
@@ -403,7 +450,7 @@ def main(argv: list[str] | None = None) -> None:
             running["steps"] += 1
             if step % 10 == 0 or step == 1:
                 rn = running
-                log({"epoch": round(epoch + epoch_micro / len(epoch_batches(epoch)), 3), "lr": sched.get_last_lr()[0],
+                log({"epoch": round(epoch + epoch_micro / len(micro_list), 3), "lr": sched.get_last_lr()[0],
                      "gnorm": round(float(gnorm), 3), "sec_per_step": round((time.time() - t0) / rn["steps"], 2),
                      "loss": round(rn["loss"] / max(1, rn["n"]), 4), "ce": round(rn["ce"] / max(1, rn["n"]), 4),
                      "rps": round(rn["rps"] / max(1, rn["n_score"]), 4),
