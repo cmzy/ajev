@@ -29,7 +29,11 @@
 4. **思考模式。** Gemma 4 的对话模板在默认（关闭思考）时，会在模型回合开头放一个空的思考块，
    紧接着的下一个 token 就是正式回答，所以可以直接在这里读字母。
 
-5. **材料太长时截短。** 材料按 token 数截到 ``max_state_tokens``（保留开头），避免个别超长样本拖慢整批、撑爆显存。
+5. **材料太长时截短。** 材料按 token 数截到 ``max_state_tokens``（保留开头）。注意**训练和推理的截断长度是两回事**：
+   训练时为了省显存截得比较短（例如 1,500），只作记录存在适配器配置的 ``train_max_state_tokens`` 里；
+   推理时默认放宽到 ``DEFAULT_INFER_STATE_TOKENS``（8,000），尽量让模型看到完整材料。
+   我们吃过这个亏：最初推理沿用了训练的 1,500，长政策 / 多跳推理题的关键证据被截掉，
+   JevBench 上材料超过 1,500 token 的 37 道题准确率只有 0.35，被误判成“LoRA 损害了推理能力”。
 """
 
 from __future__ import annotations
@@ -43,8 +47,10 @@ import torch
 from ajev.lm.prompt import LETTERS, MAX_OPTIONS, build_user_message
 from ajev.schema import Decision
 
-# LoRA 适配器目录里的 AJev 配置文件：基座模型名、提示词参数、训练步数、校准温度。
+# LoRA 适配器目录里的 AJev 配置文件：基座模型名、训练时的材料截断长度、训练步数、校准温度。
 LM_CONFIG = "ajev_lm_config.json"
+# 推理时材料的默认截断长度（token）。Gemma 4 支持 256K 上下文，8,000 足以覆盖我们用到的评测集。
+DEFAULT_INFER_STATE_TOKENS = 8000
 
 
 def load_base_model(model_id: str, dtype: torch.dtype = torch.bfloat16):
@@ -165,7 +171,8 @@ class LMPredictor:
             model = model.to(self.device)
         self.model = model.eval()
         self.batch_tokens = batch_tokens
-        self.max_state_tokens = max_state_tokens or cfg.get("max_state_tokens", 3000)
+        # 推理截断长度：显式传入的优先，否则用推理默认值；不再沿用训练时为省显存设的较短截断。
+        self.max_state_tokens = max_state_tokens or DEFAULT_INFER_STATE_TOKENS
         self.temperatures = temperatures if temperatures is not None else cfg.get("temperatures", {})
         self.table, self.valid = letter_token_table(self.tok)
         self.skipped = 0  # 选项超过 26 个、无法用字母表示的题数

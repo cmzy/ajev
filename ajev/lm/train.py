@@ -266,7 +266,8 @@ def main(argv: list[str] | None = None) -> None:
             shutil.rmtree(tmp)
         model.save_pretrained(tmp)  # PEFT 模型只保存适配器：adapter_model.safetensors + adapter_config.json
         with open(os.path.join(tmp, LM_CONFIG), "w") as f:
-            json.dump({"base_model": args.model, "max_state_tokens": args.max_state_tokens, "step": step}, f, indent=2)
+            json.dump({"base_model": args.model, "train_max_state_tokens": args.max_state_tokens, "step": step}, f,
+                      indent=2)
         if with_state:
             torch.save({"optim": optim.state_dict(), "sched": sched.state_dict(), "step": step,
                         "micro_total": micro_total, "epoch": epoch, "epoch_micro": epoch_micro, "best": best},
