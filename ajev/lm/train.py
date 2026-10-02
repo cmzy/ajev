@@ -47,6 +47,9 @@
 8. **打分题的序数平滑**（``--ordinal-smoothing 0.2``）：只有一个评分者的打分类数据源（Feedback-Collection、
    UltraFeedback 中文版、HelpSteer2），one-hot 标签改成“正确等级 0.8、相邻等级分 0.2”，原理见 ajev/lm/train_utils.py。
 
+9. **补训**（``--init-adapter 已有适配器目录``）：从一个训练好的适配器出发开一轮新的短训练，优化器和学习率调度从头开始。
+   与 ``--resume-from``（断点续训，连同步数和调度一起恢复）不同。用法见 scripts/build_supplement.py。
+
 其余（软标签 CE、打分题 RPS、打乱选项一致性、每道题权重相同、原子保存与断点续训）
 与 mmBERT 训练完全相同，原理见 ajev/train/train.py 的说明。
 """
@@ -203,6 +206,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume-from", help="resume from this checkpoint directory instead of {out}/last "
                                           "(e.g. an earlier, healthy checkpoint)")
+    ap.add_argument("--init-adapter", help="start a NEW run from these LoRA weights (fresh optimizer, schedule and "
+                                           "step count), e.g. a short supplementary run on top of a finished model")
     ap.add_argument("--skip-gnorm", type=float, default=1000.0,
                     help="absolute cap: skip the update when the pre-clip gradient norm exceeds this (0 = no cap)")
     ap.add_argument("--skip-gnorm-ratio", type=float, default=10.0,
@@ -227,6 +232,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if resume_dir:
         model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
+    elif args.init_adapter:
+        # 补训：只加载已有适配器的权重，优化器、学习率调度和步数都从头开始（和 --resume-from 不同）。
+        model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+        print(f"[lm-train] initialised LoRA weights from {args.init_adapter}", flush=True)
     else:
         model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
                                                  lora_dropout=args.lora_dropout, target_modules=lora_targets(model)))
