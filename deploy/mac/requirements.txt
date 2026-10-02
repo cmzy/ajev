@@ -1,0 +1,8 @@
+# 与训练 / 评测环境（Colab）保持一致的关键版本：transformers 5.x 对 Gemma 4 的支持与 4.x 差别很大。
+torch>=2.6
+transformers==5.17.0
+peft==0.21.0
+safetensors
+huggingface_hub>=0.34
+fastapi
+uvicorn

@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AJev Playground</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+    --accent: #2f5bd3; --accent-soft: #e6ecfb; --good: #1f8a5b; --warn: #b4690e; --bad: #c0392b;
+    --bar: #2f5bd3; --bar-bg: #eceae5; --code: #f1efea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151517; --panel: #1f1f22; --ink: #ececee; --muted: #9a9aa2; --line: #333338;
+      --accent: #7b9cff; --accent-soft: #263055; --bar: #7b9cff; --bar-bg: #2c2c31; --code: #26262a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  #health { font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+  #health b { color: var(--ink); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 6px; }
+  .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px 40px;
+         max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  h2 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  label { font-size: 12px; color: var(--muted); display: block; margin: 8px 0 4px; }
+  textarea, input, select { width: 100%; font: inherit; color: var(--ink); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }
+  textarea { resize: vertical; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+  textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; padding: 9px 18px; font-weight: 600; }
+  button.primary:disabled { opacity: .55; cursor: wait; }
+  button.link { border: none; background: none; color: var(--muted); padding: 2px 6px; }
+  button.link:hover { color: var(--bad); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 0; }
+  .q { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  .q-head { display: grid; grid-template-columns: 1fr 120px auto; gap: 8px; align-items: center; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  .meta { font-size: 12px; color: var(--muted); }
+  .err { color: var(--bad); white-space: pre-wrap; font-size: 13px; }
+  .ans { border-top: 1px solid var(--line); padding: 12px 0 4px; }
+  .ans:first-of-type { border-top: none; padding-top: 0; }
+  .ans-title { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .ans-title b { font-size: 14px; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+  .bar { display: grid; grid-template-columns: minmax(80px, 34%) 1fr 52px; gap: 8px; align-items: center;
+         margin: 5px 0; font-size: 13px; }
+  .bar .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .track { height: 10px; background: var(--bar-bg); border-radius: 5px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--bar); border-radius: 5px; transition: width .35s ease; }
+  .bar.top .name { font-weight: 600; }
+  .bar .pct { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .bar.top .pct { color: var(--ink); font-weight: 600; }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  pre { background: var(--code); border-radius: 7px; padding: 10px; overflow-x: auto; font-size: 12px; margin: 8px 0 0; }
+  .empty { color: var(--muted); padding: 30px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AJev Playground <span>· Gemma 4 12B + LoRA 决策模型</span></h1>
+  <div id="health"><span><span class="dot" id="dot"></span><span id="status">连接中…</span></span></div>
+</header>
+
+<main>
+  <section>
+    <h2>请求
+      <select id="preset" style="width:auto">
+        <option value="">载入示例…</option>
+      </select>
+    </h2>
+    <label for="state">材料 state（纯文本，或 JSON 对象）</label>
+    <textarea id="state" rows="9" placeholder="例如：客户留言、合同条款、工单内容……"></textarea>
+
+    <h2 style="margin-top:14px">问题 questions <button id="add">＋ 添加问题</button></h2>
+    <div id="questions"></div>
+
+    <div class="actions">
+      <button class="primary" id="run">运行（⌘ + Enter）</button>
+      <span class="meta" id="runmeta"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>结果</h2>
+    <div id="result"><div class="empty">填写材料和问题后点击“运行”。<br>每个问题会给出各选项的概率和置信度。</div></div>
+    <details>
+      <summary>查看原始请求 / 响应 JSON 与 curl 命令</summary>
+      <pre id="raw">（尚未运行）</pre>
+    </details>
+  </section>
+</main>
+
+<script>
+const TYPES = { noul: "是/否 noul", choice: "单选 choice", score: "打分 score" };
+const PRESETS = {
+  "客服工单（中文）": {
+    state: "订单号 88231，我上周五买的耳机到现在还没发货，客服电话一直打不通。再不发货我就要申请退款并且投诉了！",
+    questions: [
+      { id: "category", type: "choice", instructions: "这条工单属于哪一类问题？",
+        criteria: "delivery: 物流、发货、配送相关\nrefund: 退款、退货\naccount: 账户、登录、密码\nproduct: 商品质量或使用问题" },
+      { id: "urgent", type: "noul", instructions: "这条工单需要马上由人工客服处理。", criteria: "" },
+      { id: "anger", type: "score", instructions: "客户的情绪有多激动？",
+        criteria: "平静，只是询问\n有些不满\n明显生气\n非常愤怒，威胁投诉或退款" },
+    ],
+  },
+  "发票审核（中文）": {
+    state: JSON.stringify({ 采购单: { 编号: "PO-1021", 金额: 12800, 币种: "CNY", 供应商: "华东电子" },
+                            发票: { 编号: "INV-77812", 金额: 13600, 币种: "CNY", 供应商: "华东电子", 开票日期: "2026-09-12" } }, null, 2),
+    questions: [
+      { id: "amount_match", type: "noul", instructions: "发票金额与采购单金额一致。", criteria: "" },
+      { id: "action", type: "choice", instructions: "这张发票应该怎么处理？",
+        criteria: "approve: 直接通过付款\nhold: 暂缓，联系供应商核实差额\nreject: 拒绝，疑似欺诈" },
+    ],
+  },
+  "Support ticket (EN)": {
+    state: "Hi, I was charged twice for my subscription this month (two charges of $19.99 on Sep 3). Please refund the duplicate. Thanks!",
+    questions: [
+      { id: "topic", type: "choice", instructions: "What is this ticket about?",
+        criteria: "billing: charges, invoices, refunds\ntechnical: bugs, errors, outages\naccount: login, password, profile\nother: anything else" },
+      { id: "refund_requested", type: "noul", instructions: "The customer is asking for a refund.", criteria: "" },
+      { id: "politeness", type: "score", instructions: "How polite is the customer?",
+        criteria: "rude\nneutral\npolite\nvery polite" },
+    ],
+  },
+  "Security alert (EN)": {
+    state: JSON.stringify({ event: "login", user: "j.doe", country: "RO", usual_countries: ["US"],
+                            mfa: "bypassed via legacy IMAP", time: "03:12 local", failed_attempts_before: 14 }, null, 2),
+    questions: [
+      { id: "severity", type: "score", instructions: "How severe is this security event?",
+        criteria: "informational\nlow\nmedium\nhigh\ncritical" },
+      { id: "compromised", type: "noul", instructions: "The account is likely compromised.", criteria: "" },
+    ],
+  },
+};
+
+const $ = (s) => document.querySelector(s);
+const qBox = $("#questions");
+let qSeq = 0;
+
+function addQuestion(q = { id: "", type: "choice", instructions: "", criteria: "" }) {
+  const n = ++qSeq;
+  const el = document.createElement("div");
+  el.className = "q";
+  el.innerHTML = `
+    <div class="q-head">
+      <input class="qid" placeholder="问题名（英文，如 category）" value="">
+      <select class="qtype">${Object.entries(TYPES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
+      <button class="link" title="删除">✕</button>
+    </div>
+    <label>问题 instructions</label>
+    <input class="qins" placeholder="">
+    <label class="qcl"></label>
+    <textarea class="qcrit" rows="4"></textarea>
+    <div class="hint qhint"></div>`;
+  el.querySelector(".qid").value = q.id || `q${n}`;
+  el.querySelector(".qtype").value = q.type;
+  el.querySelector(".qins").value = q.instructions;
+  el.querySelector(".qcrit").value = q.criteria || "";
+  el.querySelector("button").onclick = () => el.remove();
+  el.querySelector(".qtype").onchange = () => syncHints(el);
+  syncHints(el);
+  qBox.appendChild(el);
+}
+
+function syncHints(el) {
+  const t = el.querySelector(".qtype").value;
+  const ins = el.querySelector(".qins"), cl = el.querySelector(".qcl"), h = el.querySelector(".qhint");
+  if (t === "noul") {
+    ins.placeholder = "写成一个陈述句，例如：客户要求退款。";
+    cl.textContent = "判断标准（可选）";
+    h.textContent = "可留空。也可以写两行：true: 成立的标准 / false: 不成立的标准。返回陈述成立的概率。";
+  } else if (t === "choice") {
+    ins.placeholder = "例如：这条工单属于哪一类？";
+    cl.textContent = "选项（每行一个，格式：选项名: 描述）";
+    h.textContent = "2–26 个选项。返回每个选项的概率。";
+  } else {
+    ins.placeholder = "例如：客户有多生气？";
+    cl.textContent = "等级（每行一个，从低到高）";
+    h.textContent = "2–10 个等级。返回每个等级的概率和期望等级。";
+  }
+}
+
+function parseLines(text) {
+  return text.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+function buildRequest() {
+  let state = $("#state").value.trim();
+  if (!state) throw new Error("请填写材料 state。");
+  if (/^[\[{]/.test(state)) {
+    try { state = JSON.parse(state); } catch { /* 不是合法 JSON，就当纯文本 */ }
+  }
+  const questions = {};
+  const cards = [...qBox.querySelectorAll(".q")];
+  if (!cards.length) throw new Error("请至少添加一个问题。");
+  for (const el of cards) {
+    const id = el.querySelector(".qid").value.trim();
+    const type = el.querySelector(".qtype").value;
+    const instructions = el.querySelector(".qins").value.trim();
+    const lines = parseLines(el.querySelector(".qcrit").value);
+    if (!id) throw new Error("每个问题都需要一个问题名。");
+    if (questions[id]) throw new Error(`问题名重复：${id}`);
+    if (!instructions) throw new Error(`问题 ${id} 缺少 instructions。`);
+    const q = { type, instructions };
+    if (type === "choice") {
+      if (lines.length < 2) throw new Error(`问题 ${id}：单选题至少需要 2 个选项。`);
+      q.criteria = {};
+      for (const l of lines) {
+        const m = l.match(/^([^:：]+)[:：]\s*(.*)$/);
+        const name = (m ? m[1] : l).trim();
+        q.criteria[name] = m ? m[2].trim() : "";
+      }
+    } else if (type === "score") {
+      if (lines.length < 2) throw new Error(`问题 ${id}：打分题至少需要 2 个等级。`);
+      q.criteria = lines;
+    } else if (lines.length) {
+      q.criteria = {};
+      for (const l of lines) {
+        const m = l.match(/^(true|false)\s*[:：]\s*(.*)$/i);
+        if (m) q.criteria[m[1].toLowerCase()] = m[2].trim();
+      }
+      if (!Object.keys(q.criteria).length) delete q.criteria;
+    }
+    questions[id] = q;
+  }
+  return { state, questions };
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function bars(entries) {
+  const top = Math.max(...entries.map((e) => e[1]));
+  return entries.map(([name, p]) => `
+    <div class="bar ${p === top ? "top" : ""}">
+      <span class="name" title="${esc(name)}">${esc(name)}</span>
+      <span class="track"><span class="fill" style="width:${(p * 100).toFixed(1)}%"></span></span>
+      <span class="pct">${(p * 100).toFixed(1)}%</span>
+    </div>`).join("");
+}
+
+function render(req, res) {
+  const out = [];
+  for (const [id, a] of Object.entries(res.answers)) {
+    const q = req.questions[id];
+    let head = "", body = "";
+    if (q.type === "noul") {
+      const p = a.noul;
+      head = `<span class="pill">${p >= 0.5 ? "成立" : "不成立"} · P(是) ${(p * 100).toFixed(1)}%</span>`;
+      body = bars([["是 / true", p], ["否 / false", 1 - p]]);
+    } else if (q.type === "choice") {
+      head = `<span class="pill">${esc(a.choice)} · 置信度 ${a.confidence.toFixed(2)}</span>`;
+      body = bars(Object.entries(a.probabilities).sort((x, y) => y[1] - x[1]));
+    } else {
+      head = `<span class="pill">期望等级 ${a.score.toFixed(2)} · 置信度 ${a.confidence.toFixed(2)}</span>`;
+      body = bars(a.probabilities.map((p, i) => [`${i}. ${a.legend ? a.legend[i] : q.criteria[i]}`, p]));
+    }
+    out.push(`<div class="ans"><div class="ans-title"><b>${esc(id)}</b>${head}</div>
+      <div class="meta">${esc(q.instructions)}</div>${body}</div>`);
+  }
+  $("#result").innerHTML = out.join("");
+}
+
+async function run() {
+  const btn = $("#run");
+  let req;
+  try { req = buildRequest(); } catch (e) { $("#result").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  btn.disabled = true; btn.textContent = "推理中…"; $("#runmeta").textContent = "";
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/systemone", { method: "POST", headers: { "Content-Type": "application/json" },
+                                              body: JSON.stringify(req) });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.detail || JSON.stringify(res));
+    render(req, res);
+    const wall = Math.round(performance.now() - t0);
+    $("#runmeta").textContent = `模型推理 ${Math.round(res.latency_ms)} ms · 往返 ${wall} ms · 输入 ${res.usage.input_tokens} tokens · ${Object.keys(req.questions).length} 个问题`;
+    const curl = `curl ${location.origin}/v1/systemone -H 'Content-Type: application/json' -d '${JSON.stringify(req).replace(/'/g, "'\\''")}'`;
+    $("#raw").textContent = `// 请求\n${JSON.stringify(req, null, 2)}\n\n// 响应\n${JSON.stringify(res, null, 2)}\n\n// curl\n${curl}`;
+  } catch (e) {
+    $("#result").innerHTML = `<div class="err">请求失败：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = "运行（⌘ + Enter）";
+  }
+}
+
+function loadPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  $("#state").value = p.state;
+  qBox.innerHTML = "";
+  p.questions.forEach(addQuestion);
+}
+
+async function health() {
+  try {
+    const h = await (await fetch("/health")).json();
+    $("#dot").className = "dot ok";
+    $("#status").textContent = "已就绪";
+    const t = Object.entries(h.temperatures || {}).map(([k, v]) => `${k} ${v}`).join(" / ");
+    $("#health").insertAdjacentHTML("beforeend",
+      `<span>模型 <b>${esc(h.model)}</b></span><span>设备 <b>${esc(h.device)}</b></span>` +
+      `<span>校准温度 <b>${esc(t || "未校准")}</b></span><span>材料上限 <b>${h.max_state_tokens}</b> tokens</span>`);
+  } catch {
+    $("#dot").className = "dot bad";
+    $("#status").textContent = "无法连接服务（请先运行 ./run.sh）";
+  }
+}
+
+Object.keys(PRESETS).forEach((k) => $("#preset").insertAdjacentHTML("beforeend", `<option>${esc(k)}</option>`));
+$("#preset").onchange = (e) => { loadPreset(e.target.value); e.target.value = ""; };
+$("#add").onclick = () => addQuestion();
+$("#run").onclick = run;
+document.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
+loadPreset("客服工单（中文）");
+health();
+</script>
+</body>
+</html>

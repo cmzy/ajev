@@ -53,6 +53,15 @@ LM_CONFIG = "ajev_lm_config.json"
 DEFAULT_INFER_STATE_TOKENS = 16384
 
 
+def default_device() -> str:
+    """自动选择推理设备：NVIDIA GPU（cuda）> Apple 芯片 GPU（mps）> CPU。"""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_base_model(model_id: str, dtype: torch.dtype = torch.bfloat16):
     """加载基座模型。Gemma 4 是图文统一模型，纯文本的 AutoModelForCausalLM 可能不认它，
     这时退回到图文模型类 AutoModelForImageTextToText（我们只喂文本，不影响结果）。"""
@@ -153,21 +162,26 @@ class LMPredictor:
         adapter: LoRA 适配器目录（训练产出）；None 表示零样本。适配器目录里的配置会提供
             材料截断长度和校准温度。
         temperatures: 每种题型的温度；None 时用适配器配置里的，传 {} 表示强制不用（拟合温度时这样用）。
+        device: cuda / mps / cpu；None 时自动选择（有 NVIDIA GPU 用 cuda，Apple 芯片用 mps，否则 cpu）。
+        merge: 加载适配器后把 LoRA 合并进基座权重（W ← W + B·A·缩放）。推理时每层少算一条 LoRA 支路，
+            速度更快、显存不变；代价是 bf16 下合并会带来极小的舍入差异。部署时建议打开，评测时保持关闭。
     """
 
     def __init__(self, model_id: str, adapter: str | None = None, device: str | None = None,
                  batch_tokens: int = 24000, max_state_tokens: int | None = None,
                  dtype: torch.dtype = torch.bfloat16, temperatures: dict[str, float] | None = None,
-                 model=None, tok=None) -> None:
+                 model=None, tok=None, merge: bool = False) -> None:
         cfg = read_lm_config(adapter)
         self.tok = tok or load_tokenizer(model_id)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = torch.device(device or default_device())
         if model is None:
             model = load_base_model(model_id, dtype)
             if adapter:
                 from peft import PeftModel
 
                 model = PeftModel.from_pretrained(model, adapter)
+                if merge:
+                    model = model.merge_and_unload()
             model = model.to(self.device)
         self.model = model.eval()
         self.batch_tokens = batch_tokens

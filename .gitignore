@@ -5,3 +5,4 @@ __pycache__/
 /runs/
 /checkpoints/
 .pytest_cache/
+/dist/
