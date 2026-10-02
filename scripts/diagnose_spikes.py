@@ -61,7 +61,7 @@ def main() -> None:
     if args.get("decisions_per_step"):
         # 固定题数分批（gemma_lora2 之后）：第 N 步就是计划表里的第 N 个步。
         steps = fixed_count_steps(lengths, args["decisions_per_step"], args["max_tokens"], args["batch_size"],
-                                  seed=args["seed"] * 1000)
+                                  seed=args["seed"] * 1000, sort_block=args.get("step_sort_block", 0))
         plan = [[i for mb in st for i in mb] for st in steps]
     else:
         batches = token_budget_batches(lengths, args["max_tokens"], args["batch_size"], seed=args["seed"] * 1000)

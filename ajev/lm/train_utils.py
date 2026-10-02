@@ -7,9 +7,12 @@
    长题和长题一批（只有 4–10 道），短题和短题一批（30 道左右）。梯度裁剪到 1.0 + Adam 让每一步的更新幅度
    差不多大，于是 5 道长题的一步和 30 道短题的一步影响力相同——**平均到每道题，长题被放大了好几倍**；
    同时题少的批次梯度噪声大，尖峰几乎都出在这里（被跳过的 56 步里，题数中位数只有 9）。
-   新做法：先把整个 epoch 打乱，**每 N 道题（默认 32）为一个优化器步**——长短题随机混在一起；
-   步内再按长度排序、按 token 预算切成若干小批次做梯度累积（只为省显存），攒够这 N 道才更新一次。
-   这样每一步都正好 N 道题，每道题的权重真正相同。
+   新做法：**每 N 道题（默认 32）为一个优化器步**，攒够这 N 道才更新一次——每一步都正好 N 道题，
+   每道题的权重真正相同；长题的一步也有 32 道题平均，梯度不再因为题少而噪声大。
+   怎么凑这 N 道题：整体打乱后每 ``sort_block``（默认 512）道题按长度排序，再每 N 道切成一步，最后打乱各步的顺序。
+   为什么不完全随机凑：gemma_lora3 第一次启动就是完全随机的，32 道长短悬殊的题放在一起，短题要补齐到最长题的长度，
+   实际计算量是真实 token 数的 2.07 倍，每步 26 秒、比预期慢一倍多；按 512 道一块排序后补齐只有 1.11 倍，
+   而每步平均仍有约 10.6 个不同的数据源（完全随机约 16.9 个，按 2048 道一块排序约 10.1 个）。
 
 2. **相对阈值的尖峰保护**（``SpikeGuard``）
    原来是“裁剪前梯度范数 > 100 就跳过这一步”。固定阈值分不清“长题小批次的梯度本来就大”和“训练真的出问题”，
@@ -38,29 +41,39 @@ ORDINAL_SMOOTH_SOURCES = ("feedback_collection", "ultrafeedback_zh", "helpsteer2
 
 
 def fixed_count_steps(lengths: list[int], per_step: int, max_tokens: int, max_batch: int,
-                      seed: int) -> list[list[list[int]]]:
+                      seed: int, sort_block: int = 512) -> list[list[list[int]]]:
     """把一个 epoch 的题分成“每步正好 per_step 道”的优化器步，每步再切成若干小批次。
 
     步骤：
-        第 1 步：整体打乱，按顺序每 per_step 道题组成一步（最后一步可能不足 per_step 道）；
-        第 2 步：步内按长度升序排列，顺序切小批次：再加一道题会让“题数 × 本批最长长度”超过 max_tokens，
-                或题数超过 max_batch，就另起一个小批次（与 token_budget_batches 的切法相同）。
+        第 1 步：整体打乱；每 sort_block 道题为一块，块内按长度排序，再每 per_step 道切成一步
+                （sort_block=0 表示不排序，完全随机凑步；每块最后一步可能不足 per_step 道）；
+        第 2 步：步内按长度升序，顺序切小批次：再加一道题会让“题数 × 本批最长长度”超过 max_tokens，
+                或题数超过 max_batch，就另起一个小批次（与 token_budget_batches 的切法相同）；
+        第 3 步：打乱各步的顺序，避免训练时先全是短题、后全是长题。
 
     Returns:
         步的列表；每一步是小批次的列表；每个小批次是题目下标的列表。
 
-    举个例子：lengths=[100, 900, 120, 80]，per_step=2，max_tokens=1000（假设打乱后顺序不变）
+    举个例子：lengths=[100, 900, 120, 80]，per_step=2，max_tokens=1000，sort_block=0（假设打乱后顺序不变）
         第 1 步：[0, 1] → 按长度排序 [0, 1] → 2×900 > 1000，切成 [[0], [1]]
         第 2 步：[2, 3] → 按长度排序 [3, 2] → 2×120 ≤ 1000，一个小批次 [[3, 2]]
         结果：[[[0], [1]], [[3, 2]]]——每一步都是 2 道题，长题单独占一个小批次只是为了省显存。
     """
+    rng = random.Random(seed)
     idx = list(range(len(lengths)))
-    random.Random(seed).shuffle(idx)
+    rng.shuffle(idx)
+    groups: list[list[int]] = []
+    block = sort_block or len(idx)
+    for b in range(0, len(idx), block):
+        chunk = sorted(idx[b: b + block], key=lengths.__getitem__) if sort_block else idx[b: b + block]
+        groups += [chunk[s: s + per_step] for s in range(0, len(chunk), per_step)]
+    if sort_block:
+        rng.shuffle(groups)
     steps = []
-    for s in range(0, len(idx), per_step):
+    for g in groups:
         micro: list[list[int]] = []
         cur: list[int] = []
-        for i in sorted(idx[s: s + per_step], key=lengths.__getitem__):
+        for i in sorted(g, key=lengths.__getitem__):
             if cur and (len(cur) + 1 > max_batch or (len(cur) + 1) * lengths[i] > max_tokens):
                 micro.append(cur)
                 cur = []

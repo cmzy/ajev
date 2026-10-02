@@ -7,14 +7,24 @@ from ajev.lm.train_utils import SpikeGuard, fixed_count_steps, flatten_steps, or
 
 def test_fixed_count_steps_exact_count_and_budget():
     lengths = [50 + (i * 37) % 900 for i in range(100)]
-    steps = fixed_count_steps(lengths, per_step=32, max_tokens=4000, max_batch=16, seed=1)
+    steps = fixed_count_steps(lengths, per_step=32, max_tokens=4000, max_batch=16, seed=1, sort_block=0)
     flat = [i for st in steps for mb in st for i in mb]
     assert sorted(flat) == list(range(100))  # 每道题恰好出现一次
     assert [sum(len(mb) for mb in st) for st in steps] == [32, 32, 32, 4]  # 每步正好 32 道（最后一步是余数）
     for st in steps:
         for mb in st:
             assert len(mb) <= 16 and len(mb) * max(lengths[i] for i in mb) <= 4000 or len(mb) == 1
-    assert steps == fixed_count_steps(lengths, 32, 4000, 16, seed=1)  # 同一种子结果确定（断点续训依赖这一点）
+    assert steps == fixed_count_steps(lengths, 32, 4000, 16, seed=1, sort_block=0)  # 同一种子结果确定（断点续训依赖这一点）
+
+
+def test_fixed_count_steps_sorted_blocks():
+    lengths = [50 + (i * 37) % 900 for i in range(1000)]
+    steps = fixed_count_steps(lengths, per_step=32, max_tokens=8000, max_batch=32, seed=2, sort_block=256)
+    flat = sorted(i for st in steps for mb in st for i in mb)
+    assert flat == list(range(1000))
+    counts = [sum(len(mb) for mb in st) for st in steps]
+    assert counts.count(32) == len(counts) - 1  # 每块 256 道 = 8 步 × 32；最后一块 232 道 → 7 步 + 一步 8 道
+    assert sorted(counts)[0] == 8
 
 
 def test_flatten_steps_marks_step_ends():

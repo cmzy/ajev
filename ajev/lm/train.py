@@ -181,6 +181,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="exactly this many randomly mixed decisions per optimizer step, split into token-budget "
                          "micro-batches for gradient accumulation (0 = old behaviour: one update per "
                          "--grad-accum token-budget micro-batches)")
+    ap.add_argument("--step-sort-block", type=int, default=512,
+                    help="with --decisions-per-step: sort each block of this many shuffled decisions by length "
+                         "before cutting it into steps, to limit padding (0 = fully random steps)")
     ap.add_argument("--max-state-tokens", type=int, default=16384,
                     help="state length limit (tokens) during training")
     ap.add_argument("--over-limit", choices=["drop", "truncate"], default="drop",
@@ -271,7 +274,8 @@ def main(argv: list[str] | None = None) -> None:
             seed = args.seed * 1000 + epoch
             if args.decisions_per_step:
                 cache[epoch] = flatten_steps(fixed_count_steps(lengths, args.decisions_per_step, args.max_tokens,
-                                                               args.batch_size, seed=seed))
+                                                               args.batch_size, seed=seed,
+                                                               sort_block=args.step_sort_block))
             else:
                 cache[epoch] = (token_budget_batches(lengths, args.max_tokens, args.batch_size, seed=seed), None)
         return cache[epoch]
