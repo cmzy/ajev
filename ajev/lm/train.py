@@ -34,6 +34,11 @@
 4. **保存的只是适配器**
    checkpoint 里只有 LoRA 的小矩阵（几百 MB）和它的优化器状态，基座模型不用存（推理时从 HF 下载原版，再把适配器加上去）。
 
+5. **材料长度：超长剔除，不截断**（``--max-state-tokens 4096 --over-limit drop``，原因见第 2 步的注释）。
+
+6. **梯度尖峰的处理与记录**：裁剪前梯度范数超过 ``--skip-gnorm`` 的更新被跳过；同时把这一步涉及的题的来源分布、
+   损失最大的 5 道题写进日志（``"skipped_update": true``），方便事后排查是哪类数据在制造尖峰。
+
 其余（软标签 CE、打分题 RPS、打乱选项一致性、每道题权重相同、按 token 预算分批、原子保存与断点续训）
 与 mmBERT 训练完全相同，原理见 ajev/train/train.py 的说明。
 """
@@ -47,6 +52,7 @@ import os
 import random
 import shutil
 import time
+from collections import Counter
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -138,7 +144,8 @@ def make_collate(pad_id: int):
                  "option_mask": torch.tensor([[j < len(ds[i].options) for j in range(kb)] for i in b_index])}
         return {"ids": a_ids, "mask": a_mask, "k": k, "perm_a": perm_tensor(list(perm_a), k), "option_mask": option_mask,
                 "b": b, "b_index": torch.tensor(b_index, dtype=torch.long),
-                "target": pad_targets([d.target for d in ds], k), "is_score": torch.tensor([d.type == "score" for d in ds])}
+                "target": pad_targets([d.target for d in ds], k), "is_score": torch.tensor([d.type == "score" for d in ds]),
+                "ids_meta": [(d.id, d.source) for d in ds]}
 
     return fn
 
@@ -160,7 +167,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--batch-size", type=int, default=16, help="max decisions per micro-batch")
     ap.add_argument("--max-tokens", type=int, default=12288, help="max padded tokens per micro-batch and view")
     ap.add_argument("--grad-accum", type=int, default=1)
-    ap.add_argument("--max-state-tokens", type=int, default=1500)
+    ap.add_argument("--max-state-tokens", type=int, default=4096,
+                    help="state length limit (tokens) during training")
+    ap.add_argument("--over-limit", choices=["drop", "truncate"], default="drop",
+                    help="what to do with decisions whose state exceeds --max-state-tokens: drop them (default; "
+                         "a truncated state may no longer contain the evidence its label relies on) or truncate")
     ap.add_argument("--label-smoothing", type=float, default=0.05)
     ap.add_argument("--rps-weight", type=float, default=0.5)
     ap.add_argument("--consistency-weight", type=float, default=0.5)
@@ -205,6 +216,19 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 第 2 步：数据与按 token 预算分批 ----
     train = [d for d in read_jsonl(args.train) if len(d.options) <= MAX_OPTIONS]
+    # 材料超长的题：默认直接剔除，而不是截断。截断会让“答案是按完整材料给的、模型却只看到一部分”，
+    # 等于教模型在没看到证据时也给出这个答案。第一次 LoRA 训练截到 1,500 token，705 道题（2.1%）被截断，
+    # 其中 bev_skills 近三成；放宽到 4,096 后超长的只剩约 20 道，剔除几乎不损失数据。
+    if args.over_limit == "drop":
+        kept, dropped = [], Counter()
+        for d in train:
+            if len(tok.encode(d.state, add_special_tokens=False)) > args.max_state_tokens:
+                dropped[d.source] += 1
+            else:
+                kept.append(d)
+        train = kept
+        print(f"[lm-train] dropped {sum(dropped.values())} decisions with state > {args.max_state_tokens} tokens: "
+              f"{dict(dropped.most_common())}", flush=True)
     vals = {os.path.basename(p).removesuffix(".jsonl"): read_jsonl(p) for p in args.val}
     if args.val_limit:
         vals = {k: random.Random(args.seed).sample(v, min(args.val_limit, len(v))) for k, v in vals.items()}
@@ -313,6 +337,7 @@ def main(argv: list[str] | None = None) -> None:
         return {"loss": 0.0, "ce": 0.0, "n": 0, "rps": 0.0, "n_score": 0, "cons": 0.0, "n_cons": 0, "steps": 0}
 
     t0, running, window_n, checked_grads, skipped = time.time(), fresh(), 0, False, 0
+    window_items: list[tuple[str, str, float]] = []
     while step < total_steps:
         trainset.epoch = epoch
         loader = DataLoader(trainset, batch_sampler=epoch_batches(epoch)[epoch_micro:], collate_fn=collate_fn,
@@ -339,6 +364,8 @@ def main(argv: list[str] | None = None) -> None:
             # 第 3 步：损失求和 / ref_n 后反向；累计窗口题数（每道题权重相同，原理见 mmBERT 训练）。
             (loss.sum() / ref_n).backward()
             window_n += loss.size(0)
+            # 记录本更新窗口里每道题的 (id, 来源, 损失)，若这一步因梯度尖峰被跳过，就把它们写进日志。
+            window_items += [(i, src, float(v)) for (i, src), v in zip(batch["ids_meta"], loss.detach().cpu())]
             if not checked_grads:
                 # 第一次反向后确认 LoRA 参数真的拿到了梯度（防止“冻结主体 + 梯度检查点”导致白训）。
                 if not any(p.grad is not None and p.grad.abs().sum() > 0 for p in params):
@@ -363,9 +390,14 @@ def main(argv: list[str] | None = None) -> None:
             # 这里直接放弃这一步的更新（学习率调度照常前进），并计数记入日志。
             if args.skip_gnorm and float(gnorm) > args.skip_gnorm:
                 skipped += 1
+                top = sorted(window_items, key=lambda x: -x[2])[:5]
+                log({"skipped_update": True, "gnorm": round(float(gnorm), 1),
+                     "sources": dict(Counter(src for _, src, _ in window_items).most_common()),
+                     "top_loss": [{"id": i, "source": src, "loss": round(v, 3)} for i, src, v in top]})
             else:
                 optim.step()
             optim.zero_grad(set_to_none=True)
+            window_items = []  # 本次更新已处理完（包括被跳过时写日志），清空窗口记录
             sched.step()
             step += 1
             running["steps"] += 1

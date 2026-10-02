@@ -80,6 +80,33 @@ def shuffle_check(predictor: Predictor, decisions: list[Decision], preds: list[l
     return metrics.flip_rate(preds, decisions, shuffled, predictor.predict(shuffled))
 
 
+def measure_latency(predictor: Predictor, decisions: list[Decision], n: int, seed: int = 0) -> dict:
+    """测量单题响应时间：随机抽 n 道题，每次只送 1 道给模型，记录每次耗时（毫秒）。
+
+    为什么要单独测：批量评测时几十道题一起算，平均到每道题很快，但实际部署时一个请求往往只有一两道题，
+    这时的等待时间（延迟）才是用户感受到的“响应时间”。
+    先用 3 道题预热（第一次调用会有显存分配、CUDA 内核编译等一次性开销，不应计入）。
+    返回 p50（中位数，一半请求比它快）、p95（95% 的请求比它快，反映“慢的时候有多慢”）、平均值和最大值。
+    """
+    import time
+
+    sample = random.Random(seed).sample(decisions, min(n, len(decisions)))
+    for d in sample[:3]:
+        predictor.predict([d])  # 预热
+    times = []
+    for d in sample:
+        t0 = time.perf_counter()
+        predictor.predict([d])  # predict 返回 Python 列表，GPU 计算一定已经完成，计时是准确的
+        times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+
+    def pct(q: float) -> float:
+        return round(times[min(len(times) - 1, int(q * len(times)))], 1)
+
+    return {"n": len(times), "p50_ms": pct(0.5), "p95_ms": pct(0.95),
+            "mean_ms": round(sum(times) / len(times), 1), "max_ms": round(times[-1], 1)}
+
+
 def format_table(report: dict) -> str:
     """把评测报告排版成终端里容易阅读的“定宽”文本表格。
 
@@ -105,6 +132,14 @@ def format_table(report: dict) -> str:
             lines.append(f"{name[:34]:34s}{cells}")  # name[:34] 截取前 34 个字符
     if "flip_rate" in report:
         lines.append(f"\noption-shuffle flip rate: {report['flip_rate']:.4f}")
+    t = report.get("timing")
+    if t:
+        lines.append(f"\ntiming: model load {t['load_s']}s | batch prediction {t['predict_s']}s for {t['n']} decisions "
+                     f"= {t['ms_per_decision']} ms/decision ({t['decisions_per_s']} decisions/s)")
+        if "single" in t:
+            s = t["single"]
+            lines.append(f"single-decision latency over {s['n']} requests: p50 {s['p50_ms']} ms, p95 {s['p95_ms']} ms, "
+                         f"mean {s['mean_ms']} ms, max {s['max_ms']} ms")
     return "\n".join(lines)  # 用换行符把所有行连接成一个字符串
 
 
@@ -162,11 +197,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
+    ap.add_argument("--latency-sample", type=int, default=50,
+                    help="also time N single-decision requests (0 = skip); reported as p50/p95/mean/max ms")
     args = ap.parse_args(argv)  # argv 为 None 时自动读取真实的命令行参数；测试时可以传入列表
 
+    import time
+
     decisions = read_jsonl(args.data)
-    # 第 2 步：得到预测。
+    # 第 2 步：得到预测。同时计时：模型加载、批量预测各花了多久。
     predictor: Predictor | None = None
+    t_load = time.perf_counter()
     if args.predictions:
         preds = _load_predictions(args.predictions, decisions)
     else:
@@ -191,7 +231,12 @@ def main(argv: list[str] | None = None) -> None:
             predictor = LMPredictor(args.lm_model, adapter=args.lm_adapter, max_state_tokens=args.lm_max_state_tokens)
         else:
             predictor = UniformPredictor() if args.predictor == "uniform" else RandomPredictor()
+        t_pred = time.perf_counter()
         preds = predictor.predict(decisions)
+        t_done = time.perf_counter()
+        timing = {"load_s": round(t_pred - t_load, 1), "predict_s": round(t_done - t_pred, 1), "n": len(decisions),
+                  "ms_per_decision": round(1000 * (t_done - t_pred) / max(1, len(decisions)), 1),
+                  "decisions_per_s": round(len(decisions) / max(1e-9, t_done - t_pred), 1)}
 
     # 第 3 步：保存预测结果，之后不用重新跑模型就能再次评测或做错题分析。
     if args.save_predictions:
@@ -203,6 +248,10 @@ def main(argv: list[str] | None = None) -> None:
     report = evaluate(decisions, preds)
     if args.shuffle_check and predictor is not None:
         report["flip_rate"] = shuffle_check(predictor, decisions, preds)
+    if predictor is not None:
+        if args.latency_sample:
+            timing["single"] = measure_latency(predictor, decisions, args.latency_sample)
+        report["timing"] = timing
     # 第 5 步：输出结果。
     print(format_table(report))
     if args.out:
