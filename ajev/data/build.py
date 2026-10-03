@@ -175,7 +175,8 @@ def main(argv: list[str] | None = None) -> None:
         # 否则用全局 --train-cap。中文数据源远少于英文，上限再乘以 zh_cap_mult（默认 3），
         # 把训练集中的中文比例保持在 30% 以上。
         cap = int((src.train_cap or args.train_cap) * (args.zh_cap_mult if src.lang == "zh" else 1))
-        train += list(src.iter_decisions(src.train_split, cap, args.seed, args.zh_instr_prob))
+        if src.train_split:  # train_split 为 None 的数据源只用于评测
+            train += list(src.iter_decisions(src.train_split, cap, args.seed, args.zh_instr_prob))
         # 评测 split 一次取 2 × eval_cap 条：前一半进 val，剩下的进 test_public，两者互不重叠。
         # held 是生成器，islice 消费掉前 eval_cap 条后，list(held) 拿到的就是后面的部分。
         # islice(生成器, n) 的作用类似列表切片 [:n]，但适用于生成器：只取前 n 个，不会多算。

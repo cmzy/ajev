@@ -163,7 +163,7 @@ class Source:
     name: str
     path: str
     config: str | None
-    train_split: str
+    train_split: str | None  # None = 只用于评测，不产出训练数据（例如被公开排行榜用作测试集的数据）
     eval_split: str
     lang: str
     convert: Converter

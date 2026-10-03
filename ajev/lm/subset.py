@@ -35,7 +35,7 @@ from ajev.schema import read_jsonl, write_jsonl
 
 QUOTAS = {
     "bev_default": 3000, "bev_hard": 2000, "bev_skills": 2000, "bev_counterfactual": 1000, "bev_numeric": 1000,
-    "support_tickets": 1500, "when2call": 1000, "pku_saferlhf": 1000, "helpsteer3": 800, "feedback_collection": 800,
+    "support_tickets": 1500, "pku_saferlhf": 1000, "helpsteer3": 800, "feedback_collection": 800,
 }
 ZH_SOURCES = ["afqmc", "cmnli", "ocnli", "tnews", "massive_zh", "toxicn", "cold", "ultrafeedback_zh"]
 TYPED_PREFIX = "typed_decisions/"

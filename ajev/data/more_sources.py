@@ -493,10 +493,11 @@ MORE_SOURCES: dict[str, Source] = {
                train_cap=5000),
         Source("pku_saferlhf", "PKU-Alignment/PKU-SafeRLHF", "default", "train", "test", "en", conv_pku,
                train_cap=6000),
-        # When2Call 的训练集只有对话、没有显式标签，所以用带 correct_answer 的 test/mcq，
-        # 打乱后 85% 训练、15% 评测（我们不拿 When2Call 当正式基准，所以可以这样用）。
+        # When2Call 的 test/mcq 是 Jev Decision Index 排行榜的测试集（全部 3,652 道），所以**只用于评测、不再训练**
+        # （train_split=None）。lm1 / lm2 里曾混入 1,000 道（之前 85% 训练、15% 评测），lm3 起已去掉。
+        # When2Call 公开的训练数据（train_sft / train_pref）只有对话、没有选择题标签，以后需要另写转换器才能使用。
         # 注意 mcq 是按答案类型排序的，必须打乱再切，否则评测部分全是 tool_call。
-        Source("when2call", "nvidia/When2Call", "test", "mcq#train", "mcq#eval", "en", conv_when2call,
+        Source("when2call", "nvidia/When2Call", "test", None, "mcq#eval", "en", conv_when2call,
                train_cap=4000, holdout=0.15),
         Source("wanli", "alisawuffles/WANLI", None, "train", "test", "en", conv_wanli),
         Source("toxicn", "JunyuLu/ToxiCN", None, "train", "test", "zh", conv_toxicn),

@@ -163,3 +163,8 @@ def test_shuffled_holdout_split(monkeypatch):
     assert set(tr["x"]) | set(ev["x"]) == set(range(100)) and not set(tr["x"]) & set(ev["x"])
     assert set(ev["y"]) == {"a", "b"}
     assert src.load("train#eval")["x"] == ev["x"]  # 固定种子：每次切分结果一样
+
+
+def test_when2call_is_eval_only():
+    """When2Call 的 test/mcq 是公开排行榜的测试集：只用于评测，不产出训练数据。"""
+    assert ms.MORE_SOURCES["when2call"].train_split is None
