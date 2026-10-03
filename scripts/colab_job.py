@@ -63,6 +63,7 @@ kernel 不会主动回收它，所以训练崩溃后 /proc/<pid> 目录仍然存
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -419,8 +420,8 @@ def cmd_fetch(a) -> None:
     local_dir = os.path.join(ROOT, "runs", a.run)
     os.makedirs(local_dir, exist_ok=True)
     local_tar = os.path.join(local_dir, f"{a.what}.tar")
-    colab("download", "-s", a.session, tar_remote, local_tar)
-    colab("download", "-s", a.session, tar_remote + ".sha256", local_tar + ".sha256")
+    colab("download", "-s", a.session, tar_remote, local_tar, timeout=3600)
+    colab("download", "-s", a.session, tar_remote + ".sha256", local_tar + ".sha256", timeout=300)
     # 第 3 步：本地校验。
     h = hashlib.sha256()
     with open(local_tar, "rb") as f:
@@ -443,6 +444,119 @@ def cmd_fetch(a) -> None:
     os.remove(local_tar)
     os.remove(local_tar + ".sha256")
     print(f"fetched + verified (sha256 {expected[:16]}) ->", target)
+
+
+def remote_json(session: str, code: str, timeout: float = 150, retries: int = 3) -> dict:
+    """在 VM 上执行一段 Python，读取它打印的一行 ``SYNCJSON:{...}`` 并解析成字典（带超时和重试）。
+
+    和 remote_python 不同，这里要拿回结果，所以捕获输出；连接挂住时最多等 timeout 秒再重试。
+    全部失败就抛异常——调用方据此判断“读不到状态”，而不是当作“还没完成”继续空等。
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(textwrap.dedent(code))
+        path = f.name
+    try:
+        for attempt in range(1, retries + 1):
+            try:
+                r = subprocess.run(["colab", "exec", "-s", session, "-f", path], capture_output=True, text=True,
+                                   timeout=timeout)
+                for line in (r.stdout or "").splitlines():
+                    if "SYNCJSON:" in line:
+                        return json.loads(line.split("SYNCJSON:", 1)[1])
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(5)
+        raise RuntimeError(f"could not read remote state from session {session!r}")
+    finally:
+        os.unlink(path)
+
+
+def cmd_sync(a) -> None:
+    """``sync`` 子命令：在本机后台持续运行，把 VM 上的新结果**一出现就下载**（数据审计后的防丢失措施）。
+
+    背景：gemma_lora4 训练和评测都已完成，但 Colab 在约 8 小时后终止了 VM，而“等全部结束再下载”的任务
+    又因为读取脚本写错一直空转，最终模型和评测结果全部丢失。所以：
+        1. checkpoint 一保存就下载：查询 VM 上 ``<run>/last`` 的步数，比本地新就立即 fetch（sha256 校验）；
+           训练日志出现 "done" 后再下载最终的 ``best``；
+        2. 评测结果逐个下载：``--files`` 给出的文件（可用通配符）一出现、且大小两次查询不变（写完了），就下载并核对大小；
+        3. 启动前自检：先实际查询一次远程状态，读不到就立即报错退出，绝不悄悄空转；
+           运行中连续多次读不到状态（VM 可能已被终止）也报错退出。
+    ``--done-file``：VM 上出现这个文件（例如评测脚本最后写的完成标记）且所有文件都已下载后，正常退出。
+    """
+    run_dir = f"{runs_dir(a.drive)}/{a.run}"
+    probe = f"""
+        import glob, json, os
+        out = {{"files": {{}}}}
+        try:
+            out["last_step"] = json.load(open({run_dir + "/last/ajev_lm_config.json"!r}))["step"]
+        except Exception:
+            out["last_step"] = None
+        log = {run_dir + "/log.jsonl"!r}
+        out["done"] = os.path.exists(log) and '"done": true' in open(log).read()
+        out["best"] = os.path.exists({run_dir + "/best/adapter_model.safetensors"!r})
+        for pat in {list(a.files)!r}:
+            for p in glob.glob("/content/AJev/" + pat):
+                out["files"][p[len("/content/AJev/"):]] = os.path.getsize(p)
+        out["done_file"] = bool({a.done_file!r}) and os.path.exists("/content/AJev/" + ({a.done_file!r} or ""))
+        print("SYNCJSON:" + json.dumps(out))
+    """
+    local_run = os.path.join(ROOT, "runs", a.run)
+    os.makedirs(local_run, exist_ok=True)
+
+    def local_step() -> int | None:
+        try:
+            with open(os.path.join(local_run, "last", "ajev_lm_config.json")) as f:
+                return json.load(f)["step"]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    # 第 3 项：启动自检
+    try:
+        state = remote_json(a.session, probe)
+    except RuntimeError as e:
+        raise SystemExit(f"[sync] self-test failed: {e}. Not starting (nothing would be downloaded).")
+    print(f"[sync] self-test ok: remote last step {state['last_step']}, {len(state['files'])} matching files", flush=True)
+    sizes: dict[str, int] = {}
+    got: dict[str, int] = {}
+    best_done = False
+    failures = 0
+    while True:
+        try:
+            state = remote_json(a.session, probe)
+            failures = 0
+        except RuntimeError as e:
+            failures += 1
+            print(f"[sync] {time.strftime('%H:%M')} {e} ({failures}/{a.max_failures})", flush=True)
+            if failures >= a.max_failures:
+                raise SystemExit("[sync] remote state unreadable repeatedly — the VM may have been terminated")
+            time.sleep(a.interval)
+            continue
+        # 第 1 项：checkpoint 一保存就下载
+        rs, ls = state["last_step"], local_step()
+        if rs is not None and (ls is None or rs > ls):
+            print(f"[sync] {time.strftime('%H:%M')} new checkpoint step {rs} (local {ls}) -> fetch", flush=True)
+            cmd_fetch(argparse.Namespace(session=a.session, run=a.run, drive=a.drive, what="last"))
+        if state["done"] and state["best"] and not best_done:
+            print(f"[sync] {time.strftime('%H:%M')} training done -> fetch best", flush=True)
+            cmd_fetch(argparse.Namespace(session=a.session, run=a.run, drive=a.drive, what="best"))
+            best_done = True
+        # 第 2 项：评测结果逐个下载（大小两次查询不变才算写完）
+        for path, size in state["files"].items():
+            if got.get(path) == size:
+                continue
+            if sizes.get(path) == size:
+                local = os.path.join(ROOT, path)
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                colab("download", "-s", a.session, "/content/AJev/" + path, local, check=False, timeout=900)
+                if os.path.exists(local) and os.path.getsize(local) == size:
+                    got[path] = size
+                    print(f"[sync] {time.strftime('%H:%M')} downloaded {path} ({size} bytes)", flush=True)
+            sizes[path] = size
+        pending = [p for p, sz in state["files"].items() if got.get(p) != sz]
+        if a.done_file and state["done_file"] and not pending:
+            print("[sync] done file present and all files downloaded", flush=True)
+            return
+        time.sleep(a.interval)
 
 
 def cmd_stop(a) -> None:
@@ -482,6 +596,13 @@ def main() -> None:
                                       help="extra args for ajev.train.train (after --)")
     sub.choices["status"].add_argument("--lines", type=int, default=15)
     sub.choices["fetch"].add_argument("--what", default="best")
+    p = add("sync", cmd_sync, help="keep downloading new checkpoints / result files as soon as they appear")
+    p.add_argument("--run", required=True)
+    p.add_argument("--drive", action="store_true")
+    p.add_argument("--files", nargs="*", default=[], help="result files to download, globs relative to /content/AJev")
+    p.add_argument("--done-file", default="", help="exit once this remote file exists and all files are downloaded")
+    p.add_argument("--interval", type=int, default=90)
+    p.add_argument("--max-failures", type=int, default=5)
     add("stop", cmd_stop)
 
     a = ap.parse_args()
