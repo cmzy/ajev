@@ -35,7 +35,7 @@ import random
 from collections import Counter
 from typing import Callable
 
-from ajev.schema import DEFAULT_NOUL_DESC, NOUL_FALSE, NOUL_TRUE, Decision, Option, write_jsonl
+from ajev.schema import DEFAULT_NOUL_DESC, NOUL_FALSE, NOUL_TRUE, Decision, Option, state_to_text, write_jsonl
 
 D = dt.date
 WEEKDAY_ZH = "一二三四五六日"
@@ -521,20 +521,144 @@ def gen_sla(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, l
                    noul(f"{g}/met", "gen_sla", state, q2, late <= 0, lang, g)], status
 
 
+# ==== 6. 工具调用决策（When2Call 类：该调用工具、追问、直接回答还是说明做不到）=====================
+
+# 工具库：名字 → (英文说明, 中文说明, 必填参数, 请求模板)。模板里 {参数名} 会被填入具体值；
+# 去掉某个必填参数的那部分措辞，就得到“信息不全，需要追问”的请求。
+TOOLS = {
+    "get_weather": ("Get the weather forecast for a city on a date.", "查询某个城市某天的天气预报。", ["city", "date"],
+                    {"en": "What will the weather be like in {city} on {date}?", "zh": "{date}{city}的天气怎么样？"}),
+    "book_table": ("Reserve a table at a restaurant.", "在餐厅预订座位。", ["restaurant", "time", "party_size"],
+                   {"en": "Book a table at {restaurant} for {party_size} people at {time}.",
+                    "zh": "帮我在{restaurant}订{time}的位子，{party_size}个人。"}),
+    "convert_currency": ("Convert an amount between two currencies.", "把一笔金额从一种货币换算成另一种货币。",
+                         ["amount", "from_currency", "to_currency"],
+                         {"en": "How much is {amount} {from_currency} in {to_currency}?",
+                          "zh": "{amount}{from_currency}能换多少{to_currency}？"}),
+    "track_package": ("Track a parcel by its tracking number.", "根据运单号查询包裹物流。", ["tracking_number"],
+                      {"en": "Where is my parcel {tracking_number} right now?", "zh": "我的快递{tracking_number}现在到哪了？"}),
+    "send_email": ("Send an email.", "发送一封邮件。", ["to", "subject"],
+                   {"en": "Email {to} with the subject \"{subject}\".", "zh": "给{to}发封邮件，标题是“{subject}”。"}),
+    "search_flights": ("Search flights between two cities on a date.", "查询两地之间某天的航班。",
+                       ["origin", "destination", "date"],
+                       {"en": "Find flights from {origin} to {destination} on {date}.",
+                        "zh": "查一下{date}从{origin}到{destination}的航班。"}),
+    "get_stock_price": ("Get the latest price of a stock.", "查询股票的最新价格。", ["ticker"],
+                        {"en": "What is {ticker} trading at right now?", "zh": "{ticker}现在股价多少？"}),
+    "check_order_status": ("Check the status of an order.", "查询订单状态。", ["order_id"],
+                           {"en": "Has my order {order_id} shipped yet?", "zh": "我的订单{order_id}发货了吗？"}),
+    "reset_password": ("Send a password reset link to a user account.", "给用户账号发送重置密码链接。", ["username"],
+                       {"en": "I forgot my password, my username is {username}.", "zh": "我忘记密码了，用户名是{username}。"}),
+    "create_event": ("Create a calendar event.", "创建日历事件。", ["title", "start_time"],
+                     {"en": "Put \"{title}\" on my calendar at {start_time}.", "zh": "在日历上加一个“{title}”，时间是{start_time}。"}),
+}
+VALUES = {
+    "city": {"en": ["Paris", "Tokyo", "Berlin", "Toronto"], "zh": ["上海", "杭州", "成都", "巴黎"]},
+    "date": {"en": ["Friday", "November 3", "next Monday"], "zh": ["明天", "下周一", "11月3日"]},
+    "restaurant": {"en": ["Le Petit Bistro", "Golden Dragon", "Osteria Roma"], "zh": ["外婆家", "鼎泰丰", "海底捞"]},
+    "time": {"en": ["7pm", "12:30", "8 tonight"], "zh": ["晚上7点", "中午12点半", "今晚8点"]},
+    "party_size": {"en": ["2", "4", "6"], "zh": ["2", "4", "6"]},
+    "amount": {"en": ["250", "1,000", "75"], "zh": ["250", "1000", "75"]},
+    "from_currency": {"en": ["USD", "EUR", "JPY"], "zh": ["美元", "欧元", "日元"]},
+    "to_currency": {"en": ["CNY", "GBP", "CAD"], "zh": ["人民币", "英镑", "港币"]},
+    "tracking_number": {"en": ["SF1234567890", "1Z999AA10123456784"], "zh": ["SF1234567890", "YT8899001122"]},
+    "to": {"en": ["alice@example.com", "the finance team"], "zh": ["财务部", "王经理"]},
+    "subject": {"en": ["Q3 budget", "Meeting moved"], "zh": ["三季度预算", "会议改期"]},
+    "origin": {"en": ["Boston", "Madrid", "Seattle"], "zh": ["北京", "深圳", "西安"]},
+    "destination": {"en": ["Chicago", "Lisbon", "Denver"], "zh": ["成都", "厦门", "昆明"]},
+    "ticker": {"en": ["AAPL", "TSLA", "NVDA"], "zh": ["AAPL", "TSLA", "NVDA"]},
+    "order_id": {"en": ["#58213", "A-99120"], "zh": ["#58213", "A-99120"]},
+    "username": {"en": ["jdoe", "maria.k"], "zh": ["zhangsan", "lily_w"]},
+    "title": {"en": ["Dentist", "Team sync"], "zh": ["看牙医", "团队周会"]},
+    "start_time": {"en": ["Friday 3pm", "9am tomorrow"], "zh": ["周五下午3点", "明早9点"]},
+}
+# 缺失参数在请求里换成的含糊说法（按参数类型，读起来要自然）
+VAGUE = {
+    "en": {"city": "a city", "origin": "my city", "destination": "somewhere", "date": "some day", "time": "later",
+           "start_time": "sometime", "restaurant": "a restaurant", "party_size": "a few", "amount": "some money",
+           "from_currency": "my currency", "to_currency": "another currency", "tracking_number": "it",
+           "to": "someone", "subject": "something", "ticker": "that company", "order_id": "it",
+           "username": "my account", "title": "an appointment"},
+    "zh": {"city": "那边", "origin": "这里", "destination": "那边", "date": "改天", "time": "晚点",
+           "start_time": "某个时间", "restaurant": "一家餐厅", "party_size": "几", "amount": "一些",
+           "from_currency": "这边的钱", "to_currency": "另一种货币", "tracking_number": "那个", "to": "某人",
+           "subject": "某件事", "ticker": "那家公司", "order_id": "那个", "username": "我的账号", "title": "一个安排"},
+}
+# 不需要工具、助手自己就能回答的请求，以及需要外部能力、但手头没有合适工具的请求。
+DIRECT = {"en": ["What is 15% of 80?", "Rewrite this more politely: send me the file now.",
+                 "What does the acronym API stand for?", "Give me a synonym for 'quick'."],
+          "zh": ["80 的 15% 是多少？", "把这句话改得礼貌一点：马上把文件发给我。", "API 这个缩写是什么意思？", "“迅速”有什么近义词？"]}
+CANNOT = {"en": ["Book me a hotel room in Rome for next weekend.", "Order a large pizza to my office.",
+                 "Transfer $500 from my savings to my checking account.", "Turn off the lights in my living room."],
+          "zh": ["帮我订下周末罗马的酒店。", "给我办公室点一份大号披萨。", "从储蓄账户转 500 元到活期账户。", "把我客厅的灯关掉。"]}
+TOOL_ACTIONS = ["call_tool", "ask_for_info", "answer_directly", "cannot_help"]
+TOOL_ACTION_DESC = {
+    "en": {"call_tool": "Call one of the available tools; the request contains everything that tool needs.",
+           "ask_for_info": "Ask the user for missing information that a suitable tool requires.",
+           "answer_directly": "Answer from its own knowledge without calling any tool.",
+           "cannot_help": "Explain that it cannot help: no available tool fits and it cannot do this itself."},
+    "zh": {"call_tool": "调用某个可用工具；请求里已经包含该工具需要的全部信息。",
+           "ask_for_info": "向用户追问合适的工具所需、但请求里缺少的信息。",
+           "answer_directly": "不调用工具，直接凭自身知识回答。",
+           "cannot_help": "说明无法完成：没有合适的工具，自己也做不到。"},
+}
+
+
+def gen_tool(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
+    zh = lang == "zh"
+    action = rng.choice(TOOL_ACTIONS)
+    names = list(TOOLS)
+    if action in ("call_tool", "ask_for_info"):
+        target = rng.choice(names)
+        others = [n for n in names if n != target]
+        shown = [target] + rng.sample(others, rng.randrange(2, len(others) + 1))
+        desc_en, desc_zh, req, tmpl = TOOLS[target]
+        vals = {k: rng.choice(VALUES[k][lang]) for k in req}
+        if action == "ask_for_info":  # 去掉一个必填参数：把它的值换成含糊的说法（助手必须追问）
+            miss = rng.choice(req)
+            vals[miss] = VAGUE[lang][miss]
+        text = tmpl[lang].format(**vals)
+        gold_tool = target
+    else:
+        shown = rng.sample(names, rng.randrange(3, len(names) + 1))
+        text = rng.choice(DIRECT[lang] if action == "answer_directly" else CANNOT[lang])
+        gold_tool = "none"
+    # 长材料：再加 20–40 个无关的“伪工具”，工具选择题因此常常超过 26 个选项（练习两字母编码）
+    fake = []
+    if long:
+        for k in range(rng.randrange(20, 41)):
+            fake.append((f"internal_api_{rng.randrange(1000, 9999)}_{k}",
+                         rng.choice(["Read an internal log file.", "Rotate service credentials.", "Export a CRM report.",
+                                     "Recompute warehouse stock levels.", "Archive old chat transcripts."])))
+    tools = [{"name": n, "description": TOOLS[n][1] if zh else TOOLS[n][0], "required": TOOLS[n][2]} for n in shown]
+    tools += [{"name": n, "description": d, "required": []} for n, d in fake]
+    rng.shuffle(tools)
+    state = state_to_text({"tools": tools, "user": text})
+    g = f"gen_tool/{uid}"
+    q1 = "助手应该如何回应这条请求？" if zh else "How should the assistant respond to this request?"
+    opts1 = [(a, TOOL_ACTION_DESC[lang][a]) for a in TOOL_ACTIONS]
+    tool_opts = [(t["name"], t["description"]) for t in tools] + [("none", "不需要调用任何工具" if zh else "No tool is needed or suitable")]
+    q2 = "处理这条请求应该使用哪个工具？" if zh else "Which tool is relevant to this request?"
+    return state, [choice(f"{g}/action", "gen_tool", state, q1, opts1, action, lang, g),
+                   choice(f"{g}/tool", "gen_tool", state, q2, tool_opts, gold_tool, lang, g)], action
+
+
 FAMILIES: dict[str, Callable] = {"refund": gen_refund, "invoice": gen_invoice, "contract": gen_contract,
                                  "approval": gen_approval, "sla": gen_sla}
+EXTRA_FAMILIES: dict[str, Callable] = {"tool": gen_tool}  # 不在默认列表里，保证 lm2 的生成结果可复现
 
 
 def generate(n_decisions: int, seed: int, zh_share: float = 0.35, long_share: float = 0.3,
-             split: str = "t") -> list[Decision]:
+             split: str = "t", families: list[str] | None = None) -> list[Decision]:
     """生成约 n_decisions 道题（每份材料 2 道），五类平均分配；每类按主问题的答案均衡（拒绝采样）。"""
     rng = random.Random(seed)
-    per_family = n_decisions // 2 // len(FAMILIES)
+    fams = {f: {**FAMILIES, **EXTRA_FAMILIES}[f] for f in families} if families else FAMILIES
+    per_family = n_decisions // 2 // len(fams)
     out: list[Decision] = []
     seen: set[int] = set()
-    for fam, fn in FAMILIES.items():
+    for fam, fn in fams.items():
         counts: Counter = Counter()
-        n_labels = {"refund": 3, "invoice": 4, "contract": 3, "approval": 4, "sla": 3}[fam]
+        n_labels = {"refund": 3, "invoice": 4, "contract": 3, "approval": 4, "sla": 3, "tool": 4}[fam]
         cap = per_family // n_labels + 1
         made, tries = 0, 0
         while made < per_family and tries < per_family * 200:

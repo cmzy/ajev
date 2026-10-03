@@ -384,6 +384,49 @@ def conv_when2call(row: Row, i: int, ctx: Ctx) -> Decision | None:
     return _choice(ctx, i, state, ctx.pick(T_WHEN2CALL, ctx.instr_lang()), opts, list(WHEN2CALL_OPTS).index(label))
 
 
+T_W2C_PREF = {
+    "en": ["Given the available tools and the conversation, which reply should the assistant send?",
+           "Which of the two candidate replies is the right next step for the assistant?"],
+    "zh": ["根据可用工具和对话，助手应该发送哪一个回复？", "两个候选回复中，哪一个是助手正确的下一步？"],
+}
+
+
+def _w2c_tools(raw: list) -> list[dict]:
+    """工具定义（JSON 字符串列表）只保留名字、描述和参数名，避免材料太长。"""
+    tools = []
+    for t in raw or []:
+        try:
+            spec = json.loads(t) if isinstance(t, str) else t
+        except (TypeError, json.JSONDecodeError):
+            continue
+        params = spec.get("parameters") or {}
+        tools.append({"name": spec.get("name"), "description": spec.get("description"),
+                      "parameters": list((params.get("properties") or {}).keys()),
+                      "required": params.get("required") or []})
+    return tools
+
+
+def conv_when2call_pref(row: Row, i: int, ctx: Ctx) -> Decision | None:
+    """When2Call 的官方训练数据（train_pref）：工具 + 对话 + 一好一差两个回复 → 二选一“该发哪个回复”。
+
+    为什么用它：When2Call 的 test/mcq 是 Jev Decision Index 排行榜的测试集，不能训练；
+    train_pref 是官方给的训练数据，每条都标好了好回复（chosen）和差回复（rejected），标准答案完全准确。
+    考的能力和测试集一样：该调用工具、追问缺失信息、直接回答还是说明做不到——只是候选从 4 个变成 2 个。
+    两个回复随机放在 reply_1 / reply_2，避免模型学到“好回复总在第一个”。
+    """
+    good, bad = (row.get("chosen_response") or {}).get("content"), (row.get("rejected_response") or {}).get("content")
+    msgs = row.get("messages") or []
+    if not good or not bad or not msgs or good == bad:
+        return None
+    convo = [{"role": m.get("role"), "content": _clip(m.get("content") or "", 1200)} for m in msgs[-6:]]
+    state = state_to_text({"tools": _w2c_tools(row.get("tools")), "conversation": convo})
+    first_good = ctx.rng.random() < 0.5
+    replies = [good, bad] if first_good else [bad, good]
+    opts = [Option(f"reply_{k + 1}", _clip(r, 800)) for k, r in enumerate(replies)]
+    lang = ctx.instr_lang()
+    return _choice(ctx, i, state, ctx.pick(T_W2C_PREF, lang), opts, 0 if first_good else 1)
+
+
 # ==== 7. 对抗性 NLI（alisawuffles/WANLI）===================================================
 
 
@@ -499,6 +542,9 @@ MORE_SOURCES: dict[str, Source] = {
         # 注意 mcq 是按答案类型排序的，必须打乱再切，否则评测部分全是 tool_call。
         Source("when2call", "nvidia/When2Call", "test", None, "mcq#eval", "en", conv_when2call,
                train_cap=4000, holdout=0.15),
+        # When2Call 的官方训练数据（train_pref，9,000 条一好一差的回复对），代替不能再用的 test/mcq。
+        Source("when2call_pref", "nvidia/When2Call", "train_pref", "train#train", "train#eval", "en",
+               conv_when2call_pref, train_cap=4000, holdout=0.1),
         Source("wanli", "alisawuffles/WANLI", None, "train", "test", "en", conv_wanli),
         Source("toxicn", "JunyuLu/ToxiCN", None, "train", "test", "zh", conv_toxicn),
         # COLD 的 test.csv 比其他文件多一列，整体加载会报错，所以按文件加载，用 dev.csv 做评测。

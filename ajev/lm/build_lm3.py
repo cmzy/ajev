@@ -7,7 +7,12 @@
    这 485 道题原来因为超过 26 个选项从未参与训练，修正后可以正常训练（见 scripts/fix_ticket_queues.py）；
 3. **加入多选项题**：BANKING77（77 类）和 CLINC150（151 类）用**完整标签集**作为选项，让模型练习
    A–Z 之后的两字母编码（AA、AB……）。只用这两个数据集的训练部分里 lm2 没用过的题
-   （它们的测试部分是排行榜的测试集，从不用于训练）。
+   （它们的测试部分是排行榜的测试集，从不用于训练）；
+4. **补回工具调用类决策**（去掉 When2Call 测试集后这类题为 0）：
+   - When2Call 官方训练数据 train_pref 1,500 道（“两个候选回复该发哪个”，标准答案是官方标注的好回复）；
+   - 程序生成的工具调用题 1,500 道（ajev/data/hard_gen.py 的 gen_tool：该调用工具 / 追问 / 直接回答 / 做不到，
+     以及该用哪个工具；长材料版本工具列表超过 26 个，同时练习两字母编码）。
+   另外各留出一份组成工具类开发集 dev_tool.jsonl（只评测，不训练）。
 
 其余（lm2 的 8,000 道难题、原有数据、开发集）不变；开发集 val / val_typed / dev_hard 原样复制。
 """
@@ -21,7 +26,8 @@ import random
 import shutil
 from collections import Counter
 
-from ajev.data.more_sources import TICKET_QUEUES
+from ajev.data.hard_gen import generate
+from ajev.data.more_sources import MORE_SOURCES, TICKET_QUEUES
 from ajev.schema import Decision, Option, read_jsonl, write_jsonl
 
 WIDE = {"banking77": 1000, "clinc150": 1000}
@@ -84,6 +90,15 @@ def main(argv: list[str] | None = None) -> None:
             w.validate()
             out.append(w)
         print(f"[lm3] wide {src}: {min(n, len(pool[src]))} decisions with {len(names)} options")
+
+    # 第 4 步：工具调用类决策（When2Call 官方训练数据 + 程序生成），各留一份做开发集。
+    w2c = MORE_SOURCES["when2call_pref"]
+    out += list(w2c.iter_decisions("train#train", 1500, a.seed))
+    dev_tool = list(w2c.iter_decisions("train#eval", 300, a.seed))
+    out += generate(1500, seed=a.seed + 7, split="t", families=["tool"])
+    dev_tool += generate(300, seed=a.seed + 1007, split="d", families=["tool"])
+    write_jsonl(os.path.join(a.out, "dev_tool.jsonl"), dev_tool)
+    print(f"[lm3] tool decisions: when2call_pref + gen_tool added; dev_tool {len(dev_tool)}")
 
     rng.shuffle(out)
     write_jsonl(os.path.join(a.out, "train.jsonl"), out)
