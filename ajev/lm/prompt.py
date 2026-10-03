@@ -33,7 +33,11 @@ from __future__ import annotations
 from ajev.schema import Decision
 
 LETTERS = [chr(ord("A") + i) for i in range(26)]
-MAX_OPTIONS = len(LETTERS)
+# 选项最多 255 个（与 Jev 相同）。26 个以内用字母 A–Z；超过 26 个时在 A–Z 后面接两字母编码 AA、AB……
+# 只保留分词器把它当作**一个** token 的编码（由 ajev/lm/predictor.py 的 option_labels 按分词器筛选），
+# 这样仍然只需一次前向、读“下一个 token 是哪个编码”。这是 Jev 复刻排行榜上前几名的通用做法。
+MAX_OPTIONS = 255
+MAX_LETTER_OPTIONS = len(LETTERS)
 
 TYPE_HINT = {
     "noul": "Decide whether the statement holds.",
@@ -42,26 +46,30 @@ TYPE_HINT = {
 }
 
 
-def option_lines(d: Decision) -> list[str]:
+def option_lines(d: Decision, labels: list[str] | None = None) -> list[str]:
     """每个选项一行：``A. 名字: 描述``。noul 的 true / false 写成 Yes / No，score 的等级名就是数字。"""
     lines = []
-    for letter, o in zip(LETTERS, d.options):
+    for letter, o in zip(labels or LETTERS, d.options):
         name = {"true": "Yes", "false": "No"}.get(o.name, o.name) if d.type == "noul" else o.name
         lines.append(f"{letter}. {name}: {o.desc}" if o.desc else f"{letter}. {name}")
     return lines
 
 
-def build_user_message(d: Decision, state: str | None = None) -> str:
+def build_user_message(d: Decision, state: str | None = None, labels: list[str] | None = None) -> str:
     """生成用户消息正文。``state`` 可以传入截短后的材料，默认用 d.state。
 
-    超过 26 个选项时字母不够用，调用方需要先检查（见 ``MAX_OPTIONS``）。
+    ``labels``：选项标签表（A–Z 后接两字母编码，由 option_labels 按分词器生成）；不传时只有 A–Z，
+    超过 26 个选项会报错。26 个选项以内的提示词与以前**逐字相同**，已训练的适配器不受影响；
+    超过 26 个时最后一句的 "letter" 改为 "code"。
     """
-    if len(d.options) > MAX_OPTIONS:
-        raise ValueError(f"{d.id}: {len(d.options)} options > {MAX_OPTIONS} letters")
+    labels = labels or LETTERS
+    if len(d.options) > len(labels):
+        raise ValueError(f"{d.id}: {len(d.options)} options > {len(labels)} labels")
+    word = "letter" if len(d.options) <= MAX_LETTER_OPTIONS else "code"
     return (
         "You are a decision model. Read the state and answer the question by picking exactly one option.\n\n"
         f"### State\n{d.state if state is None else state}\n\n"
         f"### Question\n{d.instructions}\n{TYPE_HINT[d.type]}\n\n"
-        "### Options\n" + "\n".join(option_lines(d)) + "\n\n"
-        "Reply with the letter of the best option only."
+        "### Options\n" + "\n".join(option_lines(d, labels)) + "\n\n"
+        f"Reply with the {word} of the best option only."
     )

@@ -27,3 +27,13 @@ def test_message_layout_state_first():
 def test_too_many_options():
     with pytest.raises(ValueError):
         build_user_message(d("choice", [f"o{i}" for i in range(27)]))
+
+
+def test_more_than_26_options_use_codes():
+    labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ["AA", "AB", "AC"]
+    msg = build_user_message(d("choice", [f"o{i}" for i in range(28)]), labels=labels)
+    assert "Z. o25" in msg and "AA. o26" in msg and "AB. o27" in msg
+    assert msg.endswith("Reply with the code of the best option only.")
+    # 26 个以内即使传了编码表，提示词也和以前逐字相同
+    small = d("choice", ["x", "y"])
+    assert build_user_message(small, labels=labels) == build_user_message(small)

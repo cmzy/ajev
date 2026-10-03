@@ -43,7 +43,8 @@ import os
 
 import torch
 
-from ajev.lm.prompt import LETTERS, MAX_OPTIONS, build_user_message
+from ajev.lm.labels import option_labels
+from ajev.lm.prompt import MAX_LETTER_OPTIONS, build_user_message
 from ajev.schema import Decision
 
 # LoRA 适配器目录里的 AJev 配置文件：基座模型名、训练时的材料截断长度、训练步数、校准温度。
@@ -81,22 +82,11 @@ def load_tokenizer(model_id: str):
 
 
 def letter_token_table(tok) -> tuple[torch.Tensor, torch.Tensor]:
-    """每个字母可能对应的 token id 表：返回 ``ids`` [26, 2] 和 ``valid`` [26, 2]。
+    """全部标签（A–Z + 两字母编码）的 token id 表 [N, 2] 和有效标记 [N, 2]，见 ``option_labels``。
 
-    每个字母最多两种写法（"A" 和 " A"），只保留恰好是单个 token 的写法；只有一种写法时，
-    第二格用第一格填充，并在 ``valid`` 里标记为无效（合并打分时会被排除，不会被重复计算）。
+    只读前 k 行（k = 本批最多的选项数），所以 26 个选项以内的题和以前完全一样。
     """
-    ids, valid = [], []
-    for letter in LETTERS:
-        forms = []
-        for form in (letter, " " + letter):
-            t = tok.encode(form, add_special_tokens=False)
-            if len(t) == 1 and t[0] not in forms:
-                forms.append(t[0])
-        if not forms:
-            raise ValueError(f"letter {letter!r} is not a single token for this tokenizer")
-        ids.append(forms + [forms[0]] * (2 - len(forms)))
-        valid.append([True] * len(forms) + [False] * (2 - len(forms)))
+    _, ids, valid = option_labels(tok)
     return torch.tensor(ids), torch.tensor(valid)
 
 
@@ -105,7 +95,8 @@ def prompt_ids(tok, d: Decision, max_state_tokens: int) -> list[int]:
     state_ids = tok.encode(d.state, add_special_tokens=False)
     state = d.state if len(state_ids) <= max_state_tokens else \
         tok.decode(state_ids[:max_state_tokens]) + " …[truncated]"
-    messages = [{"role": "user", "content": build_user_message(d, state)}]
+    labels = option_labels(tok)[0] if len(d.options) > MAX_LETTER_OPTIONS else None
+    messages = [{"role": "user", "content": build_user_message(d, state, labels)}]
     ids = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
     # 不同版本的 transformers 返回值不同：有的直接是 token 列表，有的是带 "input_ids" 的字典。
     if not isinstance(ids, list):
@@ -188,17 +179,22 @@ class LMPredictor:
         self.max_state_tokens = max_state_tokens or DEFAULT_INFER_STATE_TOKENS
         self.temperatures = temperatures if temperatures is not None else cfg.get("temperatures", {})
         self.table, self.valid = letter_token_table(self.tok)
-        self.knockout_per_group = 2  # 选项超过 26 个时，每组进入决赛的人数（见 ajev/lm/knockout.py）
+        # 选项超过 26 个时的做法："codes"（默认）= 两字母编码一次读完；"knockout" = 分组淘汰（对比实验用）。
+        # 选项比可用编码还多时（超过 255 个）总是分组淘汰。
+        self.wide_mode = "codes"
+        self.knockout_per_group = 2  # 分组淘汰时每组进入决赛的人数（见 ajev/lm/knockout.py）
 
     @torch.no_grad()
     def predict_logits(self, decisions: list[Decision]) -> list[list[float]]:
         """每道题在各选项上的打分（logits）。
 
-        不超过 26 个选项：一次前向，直接读字母打分；
-        超过 26 个选项：分组淘汰（初赛 + 决赛，见 ajev/lm/knockout.py），返回合成后的对数概率。
+        选项不超过可用标签数（A–Z + 两字母编码，最多 255 个）：一次前向，直接读标签打分；
+        更多选项（或 wide_mode="knockout" 时超过 26 个）：分组淘汰（初赛 + 决赛，见 ajev/lm/knockout.py），
+        返回合成后的对数概率。
         """
-        narrow = [i for i, d in enumerate(decisions) if len(d.options) <= MAX_OPTIONS]
-        wide = [i for i, d in enumerate(decisions) if len(d.options) > MAX_OPTIONS]
+        limit = MAX_LETTER_OPTIONS if self.wide_mode == "knockout" else len(option_labels(self.tok)[0])
+        narrow = [i for i, d in enumerate(decisions) if len(d.options) <= limit]
+        wide = [i for i, d in enumerate(decisions) if len(d.options) > limit]
         out: list[list[float]] = [[0.0] * len(d.options) for d in decisions]
         for i, lg in zip(narrow, self._letter_scores([decisions[i] for i in narrow])):
             out[i] = lg
@@ -213,7 +209,7 @@ class LMPredictor:
 
         plans, subs = [], []
         for d in decisions:
-            groups = split_groups(len(d.options), MAX_OPTIONS)
+            groups = split_groups(len(d.options), MAX_LETTER_OPTIONS)
             plans.append((d, groups, len(subs)))
             for gi, g in enumerate(groups):
                 subs.append(Decision(**{**d.__dict__, "id": f"{d.id}#g{gi}", "options": [d.options[o] for o in g],

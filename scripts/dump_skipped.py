@@ -18,7 +18,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ajev.lm.prompt import MAX_OPTIONS, build_user_message  # noqa: E402
+from ajev.lm.labels import option_labels  # noqa: E402
+from ajev.lm.prompt import MAX_LETTER_OPTIONS, build_user_message  # noqa: E402
 from ajev.lm.train_utils import fixed_count_steps  # noqa: E402
 from ajev.schema import read_jsonl, write_jsonl  # noqa: E402
 
@@ -27,7 +28,8 @@ def prompt_len(tok, d, max_state_tokens: int) -> int:
     """与 ajev/lm/predictor.py 的 prompt_ids 完全相同的计算，只是不依赖 torch。"""
     state_ids = tok.encode(d.state, add_special_tokens=False)
     state = d.state if len(state_ids) <= max_state_tokens else tok.decode(state_ids[:max_state_tokens]) + " …[truncated]"
-    ids = tok.apply_chat_template([{"role": "user", "content": build_user_message(d, state)}],
+    labels = option_labels(tok)[0] if len(d.options) > MAX_LETTER_OPTIONS else None
+    ids = tok.apply_chat_template([{"role": "user", "content": build_user_message(d, state, labels)}],
                                   add_generation_prompt=True, tokenize=True)
     return len(ids if isinstance(ids, list) else ids["input_ids"])
 
@@ -45,7 +47,8 @@ def main() -> None:
     log = [json.loads(line) for line in open(a.log or os.path.join(a.run, "log.jsonl"))]
     assert args["decisions_per_step"], "only fixed-count runs are supported"
     tok = AutoTokenizer.from_pretrained(args["model"])
-    train = [d for d in read_jsonl(a.train) if len(d.options) <= MAX_OPTIONS]
+    # 旧的训练（args.json 里没有 max_options）只用 26 个以内的选项
+    train = [d for d in read_jsonl(a.train) if len(d.options) <= args.get("max_options", 26)]
     if args.get("over_limit") == "drop":
         train = [d for d in train if len(tok.encode(d.state, add_special_tokens=False)) <= args["max_state_tokens"]]
     lengths = [prompt_len(tok, d, args["max_state_tokens"]) for d in train]

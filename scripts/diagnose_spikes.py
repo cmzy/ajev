@@ -30,7 +30,6 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ajev.lm.predictor import load_tokenizer, prompt_ids  # noqa: E402
-from ajev.lm.prompt import MAX_OPTIONS  # noqa: E402
 from ajev.lm.train_utils import fixed_count_steps  # noqa: E402
 from ajev.schema import read_jsonl  # noqa: E402
 from ajev.train.train import token_budget_batches  # noqa: E402
@@ -53,7 +52,8 @@ def main() -> None:
 
     # 第 1 步：用与训练相同的分词器和截断长度重算每道题的提示词长度，重建第 0 个 epoch 的分批。
     tok = load_tokenizer(args["model"])
-    train = [d for d in read_jsonl(a.train) if len(d.options) <= MAX_OPTIONS]
+    # 旧的训练（args.json 里没有 max_options）只用 26 个以内的选项
+    train = [d for d in read_jsonl(a.train) if len(d.options) <= args.get("max_options", 26)]
     if args.get("over_limit") == "drop":
         train = [d for d in train if len(tok.encode(d.state, add_special_tokens=False)) <= max_state]
     state_len = [len(tok.encode(d.state, add_special_tokens=False)) for d in train]

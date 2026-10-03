@@ -187,6 +187,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--step-sort-block", type=int, default=512,
                     help="with --decisions-per-step: sort each block of this many shuffled decisions by length "
                          "before cutting it into steps, to limit padding (0 = fully random steps)")
+    ap.add_argument("--max-options", type=int, default=MAX_OPTIONS,
+                    help="skip decisions with more options than this (26 = letters A-Z only, as in gemma_lora4 and earlier)")
     ap.add_argument("--max-state-tokens", type=int, default=16384,
                     help="state length limit (tokens) during training")
     ap.add_argument("--over-limit", choices=["drop", "truncate"], default="drop",
@@ -247,7 +249,9 @@ def main(argv: list[str] | None = None) -> None:
     table, valid = letter_token_table(tok)
 
     # ---- 第 2 步：数据与按 token 预算分批 ----
-    train = [d for d in read_jsonl(args.train) if len(d.options) <= MAX_OPTIONS]
+    # 选项数上限：默认 255（A–Z + 两字母编码）。gemma_lora4 及之前的训练只用了 26 个以内的题（字母 A–Z）；
+    # 这个参数记录在 args.json 里，排查脚本据此重建当时的数据。
+    train = [d for d in read_jsonl(args.train) if len(d.options) <= args.max_options]
     # 材料超长的题：默认直接剔除，而不是截断。截断会让“答案是按完整材料给的、模型却只看到一部分”，
     # 等于教模型在没看到证据时也给出这个答案。第一次 LoRA 训练截到 1,500 token，705 道题（2.1%）被截断，
     # 其中 bev_skills 近三成；放宽到 4,096 后超长的只剩约 20 道，剔除几乎不损失数据。
