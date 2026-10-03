@@ -40,8 +40,9 @@
    切小批次做梯度累积。原来“每个按 token 装满的小批次就更新一次”会让长题被放大好几倍、并制造梯度尖峰，
    原理见 ajev/lm/train_utils.py。设为 0 时退回旧的分批方式（``--grad-accum`` 个小批次更新一次）。
 
-7. **梯度尖峰的处理与记录**：裁剪前梯度范数超过最近 50 个正常步中位数的 ``--skip-gnorm-ratio`` 倍（默认 10），
-   或超过绝对上限 ``--skip-gnorm``（默认 1000），或是 NaN / inf，就跳过这一步的更新；同时把这一步涉及的题的
+7. **梯度尖峰的处理与记录**：按步的平均材料长度把步分成 ``--spike-buckets`` 档（默认 4），裁剪前梯度范数超过
+   **同档**最近 50 个正常步中位数的 ``--skip-gnorm-ratio`` 倍（默认 30），或超过绝对上限 ``--skip-gnorm``（默认 2000），
+   或是 NaN / inf，就跳过这一步的更新（分档的原因见 docs/skipped_lora4.md：梯度范数随材料长度增长）；同时把这一步涉及的题的
    来源分布、损失最大的 5 道题写进日志（``"skipped_update": true``），方便事后排查。
 
 8. **打分题的序数平滑**（``--ordinal-smoothing 0.2``）：只有一个评分者的打分类数据源（Feedback-Collection、
@@ -82,7 +83,8 @@ from ajev.lm.predictor import (
 from ajev.lm.prompt import MAX_OPTIONS
 from ajev.schema import Decision, read_jsonl
 from ajev.train.losses import rps, smooth, soft_ce, symmetric_kl, unpermute
-from ajev.lm.train_utils import ORDINAL_SMOOTH_SOURCES, SpikeGuard, fixed_count_steps, flatten_steps, ordinal_smooth
+from ajev.lm.train_utils import (ORDINAL_SMOOTH_SOURCES, BucketedSpikeGuard, fixed_count_steps, flatten_steps,
+                                  ordinal_smooth, quantile_edges, step_mean_lengths)
 from ajev.train.train import META_FILE, STATE_FILE, find_resumable, token_budget_batches
 
 # 一个完整的 LoRA checkpoint 必须包含的文件（配置文件放第一个，完整性检查从它读取 step）。
@@ -210,11 +212,14 @@ def main(argv: list[str] | None = None) -> None:
                                           "(e.g. an earlier, healthy checkpoint)")
     ap.add_argument("--init-adapter", help="start a NEW run from these LoRA weights (fresh optimizer, schedule and "
                                            "step count), e.g. a short supplementary run on top of a finished model")
-    ap.add_argument("--skip-gnorm", type=float, default=1000.0,
+    ap.add_argument("--skip-gnorm", type=float, default=2000.0,
                     help="absolute cap: skip the update when the pre-clip gradient norm exceeds this (0 = no cap)")
-    ap.add_argument("--skip-gnorm-ratio", type=float, default=10.0,
+    ap.add_argument("--skip-gnorm-ratio", type=float, default=30.0,
                     help="skip the update when the pre-clip gradient norm exceeds this many times the median of "
-                         "the last 50 accepted steps (0 = off); NaN / inf gradients are always skipped")
+                         "the last 50 accepted steps of similar length (0 = off); NaN / inf are always skipped")
+    ap.add_argument("--spike-buckets", type=int, default=4,
+                    help="compare each step only with steps of similar mean prompt length: split steps into this many "
+                         "length buckets by quantile, each with its own median (1 = one global median, as in gemma_lora4)")
     args = ap.parse_args(argv)
 
     # ---- 第 1 步：设备、模型、LoRA（或从 last 续训）----
@@ -311,7 +316,13 @@ def main(argv: list[str] | None = None) -> None:
         return max(0.0, 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup))))
 
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
-    guard = SpikeGuard(ratio=args.skip_gnorm_ratio, abs_limit=args.skip_gnorm)
+    # 尖峰保护按“步的平均材料长度”分档（原理见 ajev/lm/train_utils.py 的 BucketedSpikeGuard）：
+    # 用第 0 个 epoch 的分批计划算出每一步的平均长度，按分位数切档。分档只由数据和种子决定，续训时完全一致。
+    micro0, ends0 = epoch_plan(0)
+    step_lens = step_mean_lengths(micro0, ends0, lengths, args.grad_accum)
+    edges = quantile_edges(step_lens, args.spike_buckets) if args.spike_buckets > 1 else []
+    guard = BucketedSpikeGuard(edges, ratio=args.skip_gnorm_ratio, abs_limit=args.skip_gnorm)
+    print(f"[lm-train] spike guard: {len(edges) + 1} length buckets, edges {[round(e) for e in edges]} tokens", flush=True)
     step, micro_total, epoch, epoch_micro, best = 0, 0, 0, 0, -1.0
     if resume_dir:
         st = torch.load(os.path.join(resume_dir, STATE_FILE), map_location="cpu", weights_only=False)
@@ -397,6 +408,7 @@ def main(argv: list[str] | None = None) -> None:
 
     t0, running, window_n, checked_grads, skipped = time.time(), fresh(), 0, False, 0
     window_items: list[tuple[str, str, float]] = []
+    window_lens: list[int] = []  # 本步各道题的提示词长度，用来决定尖峰保护的档位
     while step < total_steps:
         trainset.epoch = epoch
         micro_list, step_ends = epoch_plan(epoch)
@@ -437,6 +449,7 @@ def main(argv: list[str] | None = None) -> None:
             running["cons"] += cons.sum().item(); running["n_cons"] += int(batch["b_index"].numel())
             # 这个小批次是不是这一步的最后一个：固定题数分批看计划表，旧分批方式每 grad_accum 个小批次一步。
             is_end = step_ends[epoch_micro] if step_ends is not None else (micro_total + 1) % args.grad_accum == 0
+            window_lens += [lengths[i] for i in micro_list[epoch_micro]]
             micro_total += 1
             epoch_micro += 1
             if not is_end:
@@ -450,12 +463,15 @@ def main(argv: list[str] | None = None) -> None:
             # 梯度尖峰保护：裁剪前的梯度范数相对最近的正常水平异常大，说明这一批把模型推向了损失曲面很陡的地方。
             # 裁剪虽然限制了步长，但方向往往不可靠，连续几次就可能把模型推坏（第一次训练就是这样）。
             # 这里直接放弃这一步的更新（学习率调度照常前进），并计数记入日志。判断规则见 SpikeGuard。
-            median_before = guard.median()
-            if guard.should_skip(float(gnorm)):
+            mean_len = sum(window_lens) / max(1, len(window_lens))
+            window_lens = []
+            median_before = guard.median(mean_len)
+            if guard.should_skip(float(gnorm), mean_len):
                 skipped += 1
                 top = sorted(window_items, key=lambda x: -x[2])[:5]
                 log({"skipped_update": True, "gnorm": round(float(gnorm), 1),
                      "median_gnorm": round(median_before, 2) if median_before is not None else None,
+                     "len_bucket": guard.bucket(mean_len), "step_mean_tokens": round(mean_len),
                      "sources": dict(Counter(src for _, src, _ in window_items).most_common()),
                      "top_loss": [{"id": i, "source": src, "loss": round(v, 3)} for i, src, v in top]})
             else:

@@ -54,3 +54,26 @@ def test_ordinal_smooth():
     assert ordinal_smooth([0, 0.5, 0.5], 0.2) == [0, 0.5, 0.5]  # 已经是软标签，不处理
     out = ordinal_smooth([0, 0, 0, 0, 0, 0, 1], 0.3)
     assert math.isclose(sum(out), 1.0) and math.isclose(out[5], 0.3)
+
+
+def test_step_mean_lengths_and_edges():
+    from ajev.lm.train_utils import quantile_edges, step_mean_lengths
+    micro, ends = [[0, 1], [2], [3]], [False, True, True]
+    assert step_mean_lengths(micro, ends, [100, 300, 200, 50]) == [200.0, 50.0]
+    assert step_mean_lengths([[0], [1], [2], [3]], None, [100, 300, 200, 50], grad_accum=2) == [200.0, 125.0]
+    assert quantile_edges([float(x) for x in range(100)], 4) == [25.0, 50.0, 75.0]
+
+
+def test_bucketed_guard_compares_long_steps_with_long_steps():
+    from ajev.lm.train_utils import BucketedSpikeGuard
+    g = BucketedSpikeGuard(edges=[500, 1500], ratio=30, abs_limit=2000, min_history=5)
+    for _ in range(5):
+        assert not g.should_skip(3.0, mean_len=200)     # 短题步：中位数 3
+        assert not g.should_skip(150.0, mean_len=2500)  # 长题步：中位数 150
+    assert not g.should_skip(400.0, mean_len=2600)      # 长题步 400 只有同档中位数的 2.7 倍：不跳过
+    assert g.should_skip(400.0, mean_len=250)           # 短题步 400 是同档中位数的 133 倍：跳过
+    assert g.should_skip(2500.0, mean_len=2600)         # 超过绝对上限：跳过
+    assert g.bucket(100) == 0 and g.bucket(800) == 1 and g.bucket(5000) == 2
+    g2 = BucketedSpikeGuard(edges=[500, 1500], min_history=5)
+    g2.load_state_dict(g.state_dict())
+    assert g2.median(2500) == g.median(2500)

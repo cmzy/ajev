@@ -154,3 +154,59 @@ def ordinal_smooth(target: list[float], eps: float) -> list[float]:
     for j in nbrs:
         out[j] = eps / len(nbrs)
     return out
+
+
+def step_mean_lengths(micro: list[list[int]], ends: list[bool] | None, lengths: list[int],
+                      grad_accum: int = 1) -> list[float]:
+    """每个优化器步的平均提示词长度（token）。固定题数分批时按 ends 划分步；旧分批方式每 grad_accum 个小批次一步。"""
+    out, cur = [], []
+    for j, mb in enumerate(micro):
+        cur += [lengths[i] for i in mb]
+        end = ends[j] if ends is not None else (j + 1) % grad_accum == 0
+        if end:
+            out.append(sum(cur) / len(cur))
+            cur = []
+    if cur:
+        out.append(sum(cur) / len(cur))
+    return out
+
+
+def quantile_edges(values: list[float], n_buckets: int) -> list[float]:
+    """把数值按分位数切成 n_buckets 档，返回 n_buckets-1 个分界点。例如 4 档 → 25%、50%、75% 分位数。"""
+    s = sorted(values)
+    return [s[min(len(s) - 1, int(len(s) * k / n_buckets))] for k in range(1, n_buckets)]
+
+
+class BucketedSpikeGuard:
+    """按“步的平均材料长度”分档的尖峰保护：每一档各自维护一个 SpikeGuard（各自的近期中位数）。
+
+    为什么要分档（gemma_lora4 的排查结论，见 docs/skipped_lora4.md）：梯度范数随材料长度增长，
+    长题集中的步梯度范数天然是短题步的几十倍。只用一个全局中位数时，中位数由占多数的短题步决定，
+    长题步就会被误判成尖峰（lora4 被跳过的 17 步全是长题步，损失却很正常）。
+    分档后长题步只和长题步比较；NaN / inf 和超过绝对上限的仍然一定跳过。
+
+    举个例子：edges=[300, 600, 1200] → 4 档：<300、300–600、600–1200、≥1200 token。
+        一个平均 2,500 token 的步落在第 4 档，只和第 4 档最近 50 个正常步的中位数比较。
+    """
+
+    def __init__(self, edges: list[float], ratio: float = 30.0, abs_limit: float = 2000.0, window: int = 50,
+                 min_history: int = 10) -> None:
+        self.edges = list(edges)
+        self.guards = [SpikeGuard(ratio=ratio, abs_limit=abs_limit, window=window, min_history=min_history)
+                       for _ in range(len(self.edges) + 1)]
+
+    def bucket(self, mean_len: float) -> int:
+        return sum(mean_len >= e for e in self.edges)
+
+    def median(self, mean_len: float) -> float | None:
+        return self.guards[self.bucket(mean_len)].median()
+
+    def should_skip(self, gnorm: float, mean_len: float) -> bool:
+        return self.guards[self.bucket(mean_len)].should_skip(gnorm)
+
+    def state_dict(self) -> dict:
+        return {"edges": self.edges, "guards": [g.state_dict() for g in self.guards]}
+
+    def load_state_dict(self, st: dict) -> None:
+        for g, s in zip(self.guards, st.get("guards", [])):
+            g.load_state_dict(s)
