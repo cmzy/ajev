@@ -194,6 +194,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--lm-adapter", help="LoRA adapter directory for --predictor lm (default: zero-shot)")
     ap.add_argument("--lm-max-state-tokens", type=int, default=None,
                     help="truncate the state to this many tokens at inference (default: 16384)")
+    ap.add_argument("--lm-wide-mode", choices=["codes", "knockout"], default="codes",
+                    help="questions with more than 26 options: two-letter codes in one pass (default) or knockout")
     ap.add_argument("--save-predictions", help="write {id, probs} JSONL here")
     ap.add_argument("--shuffle-check", action="store_true", help="also measure option-order flip rate")
     ap.add_argument("--out", help="write the full report as JSON here")
@@ -229,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
             from ajev.lm.predictor import LMPredictor
 
             predictor = LMPredictor(args.lm_model, adapter=args.lm_adapter, max_state_tokens=args.lm_max_state_tokens)
+            predictor.wide_mode = args.lm_wide_mode
         else:
             predictor = UniformPredictor() if args.predictor == "uniform" else RandomPredictor()
         t_pred = time.perf_counter()
