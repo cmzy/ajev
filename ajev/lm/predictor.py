@@ -131,9 +131,24 @@ def letter_logits(model, ids: torch.Tensor, mask: torch.Tensor, table: torch.Ten
         out = model(input_ids=ids, attention_mask=mask, logits_to_keep=1).logits[:, -1].float()
     except TypeError:  # 旧版本不支持 logits_to_keep
         out = model(input_ids=ids, attention_mask=mask).logits[:, -1].float()
+    return label_scores(out, table, valid, k)
+
+
+def label_scores(out: torch.Tensor, table: torch.Tensor, valid: torch.Tensor, k: int) -> torch.Tensor:
+    """完整词表 logits [B, V] → 前 k 个标签的打分 [B, k]（每个标签两种写法 logsumexp 合并）。"""
     table, valid = table.to(out.device), valid.to(out.device)
-    per_form = out[:, table].masked_fill(~valid, float("-inf"))  # [B, 26, 2]
+    per_form = out[:, table].masked_fill(~valid, float("-inf"))  # [B, N, 2]
     return torch.logsumexp(per_form, dim=-1)[:, :k]
+
+
+def common_prefix_len(seqs: list[list[int]]) -> int:
+    """几条 token 序列从开头起逐个相同的最长长度。例如 [[1, 2, 3], [1, 2, 4]] → 2。"""
+    n = min(len(s) for s in seqs)
+    first = seqs[0]
+    for j in range(n):
+        if any(s[j] != first[j] for s in seqs[1:]):
+            return j
+    return n
 
 
 def read_lm_config(adapter: str | None) -> dict:
@@ -155,12 +170,14 @@ class LMPredictor:
         device: cuda / mps / cpu；None 时自动选择（有 NVIDIA GPU 用 cuda，Apple 芯片用 mps，否则 cpu）。
         merge: 加载适配器后把 LoRA 合并进基座权重（W ← W + B·A·缩放）。推理时每层少算一条 LoRA 支路，
             速度更快、显存不变；代价是 bf16 下合并会带来极小的舍入差异。部署时建议打开，评测时保持关闭。
+        prefix_cache: 同一段材料上的多道题共用开头的 KV cache，材料只算一次（见 _shared_prefix_scores）。
+            一个请求带多个问题时快很多；结果与逐题计算只有 bf16 级别的数值差异。
     """
 
     def __init__(self, model_id: str, adapter: str | None = None, device: str | None = None,
                  batch_tokens: int = 24000, max_state_tokens: int | None = None,
                  dtype: torch.dtype = torch.bfloat16, temperatures: dict[str, float] | None = None,
-                 model=None, tok=None, merge: bool = False) -> None:
+                 model=None, tok=None, merge: bool = False, prefix_cache: bool = False) -> None:
         cfg = read_lm_config(adapter)
         self.tok = tok or load_tokenizer(model_id)
         self.device = torch.device(device or default_device())
@@ -183,6 +200,11 @@ class LMPredictor:
         # 选项比可用编码还多时（超过 255 个）总是分组淘汰。
         self.wide_mode = "codes"
         self.knockout_per_group = 2  # 分组淘汰时每组进入决赛的人数（见 ajev/lm/knockout.py）
+        # 同一段材料上的多道题共用开头的 KV cache（见 _shared_prefix_scores）。只在推理用；
+        # 公共开头短于 min_shared_prefix 个 token 时不值得，照常逐题计算。
+        self.prefix_cache = prefix_cache
+        self.min_shared_prefix = 64
+        self.prefix_cache_bytes = 16 * 2 ** 30  # 一批尾巴复制出的开头 cache 总共最多占 16 GB
 
     @torch.no_grad()
     def predict_logits(self, decisions: list[Decision]) -> list[list[float]]:
@@ -232,6 +254,8 @@ class LMPredictor:
         self.model.eval()
         out: list[list[float]] = [[0.0] * len(d.options) for d in decisions]
         todo = [(i, prompt_ids(self.tok, d, self.max_state_tokens)) for i, d in enumerate(decisions)]
+        if self.prefix_cache:
+            todo = self._shared_prefix_scores(decisions, todo, out)
         # 按长度排序后按 token 预算分批：长度相近的放一起，补齐浪费最少。
         todo.sort(key=lambda x: len(x[1]))
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
@@ -255,6 +279,69 @@ class LMPredictor:
         if was_training:
             self.model.train()
         return out
+
+    def _shared_prefix_scores(self, decisions: list[Decision], todo: list[tuple[int, list[int]]],
+                              out: list[list[float]]) -> list[tuple[int, list[int]]]:
+        """同一段材料上的多道题：共同开头只算一次（prefix KV cache），返回没走这条路的题。
+
+        我们的提示词是“说明 + 材料”在前、“问题 + 选项”在后，所以同一请求里的题开头逐 token 相同。做法：
+            第 1 步：按材料分组；组内对**完整提示词**的 token 序列取最长公共开头 p
+                    （不单独给材料分词，避免材料和问题交界处切出不同的 token）；
+            第 2 步：开头单独前向一次，得到它的 KV cache；
+            第 3 步：各题的尾巴右侧补齐成一批，接在复制出的 cache 后面前向，读每条尾巴最后一个真实 token 的打分。
+        模型看到的 token 和逐题计算完全一样，只是省掉了重复计算；bf16 下有极小的数值差异。
+        """
+        groups: dict[str, list[tuple[int, list[int]]]] = {}
+        for item in todo:
+            groups.setdefault(decisions[item[0]].state, []).append(item)
+        rest = []
+        for items in groups.values():
+            p = common_prefix_len([s for _, s in items]) if len(items) > 1 else 0
+            p = min(p, min(len(s) for _, s in items) - 1)  # 每条尾巴至少留 1 个 token
+            if p < self.min_shared_prefix:
+                rest.extend(items)
+                continue
+            self._score_with_prefix(decisions, items, p, out)
+        return rest
+
+    def _score_with_prefix(self, decisions: list[Decision], items: list[tuple[int, list[int]]], p: int,
+                           out: list[list[float]]) -> None:
+        import copy
+
+        prefix = torch.tensor([items[0][1][:p]], device=self.device)
+        cache = self.model(input_ids=prefix, use_cache=True, logits_to_keep=1).past_key_values
+        # 复制一份开头 cache 要多少显存：按它决定一批放几条尾巴（长材料时一批少放几条）。
+        row_bytes = sum(t.numel() * t.element_size() for layer in cache.layers for t in (layer.keys, layer.values))
+        pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+        tails = sorted(((i, s[p:]) for i, s in items), key=lambda x: len(x[1]))
+        start = 0
+        while start < len(tails):
+            end = start + 1
+            while end < len(tails) and (end - start + 1) * len(tails[end][1]) <= self.batch_tokens \
+                    and (end - start + 1) * row_bytes <= self.prefix_cache_bytes:
+                end += 1
+            chunk = tails[start:end]
+            start = end
+            width = max(len(t) for _, t in chunk)
+            ids = torch.full((len(chunk), width), pad, dtype=torch.long)
+            mask = torch.zeros((len(chunk), p + width), dtype=torch.long)
+            mask[:, :p] = 1
+            for r, (_, t) in enumerate(chunk):  # 尾巴补在右边：前面的位置编号和逐题计算时一致
+                ids[r, : len(t)] = torch.tensor(t)
+                mask[r, p: p + len(t)] = 1
+            c = copy.deepcopy(cache)
+            c.batch_repeat_interleave(len(chunk))
+            last = [len(t) - 1 for _, t in chunk]
+            keep = sorted(set(last))
+            logits = self.model(input_ids=ids.to(self.device), attention_mask=mask.to(self.device),
+                                past_key_values=c, use_cache=True,
+                                logits_to_keep=torch.tensor(keep, device=self.device)).logits
+            rows = logits[torch.arange(len(chunk)), torch.tensor([keep.index(j) for j in last])].float()
+            k = max(len(decisions[i].options) for i, _ in chunk)
+            scores = label_scores(rows, self.table, self.valid, k)
+            for r, (i, _) in enumerate(chunk):
+                out[i] = scores[r, : len(decisions[i].options)].tolist()
+            del c, logits
 
     def predict(self, decisions: list[Decision]) -> list[list[float]]:
         """每道题的选项概率：字母打分按题型温度缩放后做 softmax（未校准时温度为 1）。"""
