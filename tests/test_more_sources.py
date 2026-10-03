@@ -60,6 +60,15 @@ def test_ticket_three_questions():
     assert p.type == "score" and p.gold_index == 2
     for d in ds:
         d.validate()
+    # 队列选项固定是 10 个团队队列，不受数据里收集到的话题标签影响
+    assert q.option_names == list(ms.TICKET_QUEUES) and all(o.desc for o in q.options)
+
+
+def test_ticket_topic_tag_queue_is_skipped():
+    """queue 字段是话题标签（不是 10 个团队队列之一）的行直接跳过。"""
+    row = {"subject": "x", "body": "y", "queue": "IT & Technology/Software Development", "type": "Incident",
+           "priority": "high"}
+    assert ms.conv_ticket(row, 0, ctx("support_tickets", ["IT & Technology/Software Development"])) is None
 
 
 def test_helpsteer3_soft_target_from_individual_votes():

@@ -157,26 +157,44 @@ PRIORITY_LEVELS = {
 }
 PRIORITY_INDEX = {"low": 0, "medium": 1, "high": 2}
 
+# 工单要分配到的 10 个团队队列（选项名 → 说明）。
+# 为什么写死而不是从数据里收集：数据集里还有一部分行的 queue 字段是“IT & Technology/Software Development”
+# 这类话题标签（共 42 个），这些行缺少优先级或类型，本来就会被过滤掉，但它们的 queue 值曾被一起收集进选项，
+# 导致每道队列题都有 52 个选项，其中 42 个永远不可能是正确答案、又看起来说得通（lora2 在这批题上只有 8% 准确率）。
+TICKET_QUEUES = {
+    "Technical Support": "Technical problems with the product or service: errors, bugs, configuration.",
+    "Product Support": "Questions about using product features or how a product works.",
+    "Customer Service": "General customer requests, complaints and account matters.",
+    "IT Support": "Internal IT issues: hardware, network, accounts and access.",
+    "Billing and Payments": "Invoices, charges, refunds and payment methods.",
+    "Returns and Exchanges": "Returning or exchanging purchased items.",
+    "Service Outages and Maintenance": "Service downtime, outages and planned maintenance.",
+    "Sales and Pre-Sales": "Pricing, quotes, demos and questions before buying.",
+    "General Inquiry": "Requests that do not fit any specific team.",
+    "Human Resources": "Employment, payroll, benefits and other HR matters.",
+}
+
 
 def conv_ticket(row: Row, i: int, ctx: Ctx) -> list[Decision] | None:
     """一张工单 → 3 道题：分到哪个队列（choice）、工单类型（choice）、优先级（score）。
 
     举个例子：subject="Account Disruption"，body="...the account portal appears to be offline..."，
     queue="Technical Support"，type="Incident"，priority="high"
-        → choice：10 个队列里选 "Technical Support"
+        → choice：10 个团队队列（TICKET_QUEUES）里选 "Technical Support"
         → choice：4 种类型里选 "Incident"
         → score：低 / 中 / 高 三级里选第 2 级（高）
     工单有英文也有德文，mmBERT 是多语言模型，可以直接读。
     """
     if not (row.get("body") and row.get("queue") and row.get("type") and row.get("priority")):
         return None
-    if row["priority"] not in PRIORITY_INDEX or row["type"] not in TTYPE_DESC:
+    if row["priority"] not in PRIORITY_INDEX or row["type"] not in TTYPE_DESC or row["queue"] not in TICKET_QUEUES:
         return None
     state = state_to_text({"subject": row.get("subject") or "", "body": row["body"]})
     lang = ctx.instr_lang()
-    queues = ctx.label_names  # 数据里出现过的全部队列名（由 Source.label_field="queue" 推断）
+    queues = list(TICKET_QUEUES)
     ds = [
-        _choice(ctx, i, state, ctx.pick(T_QUEUE, lang), [Option(q) for q in queues], queues.index(row["queue"])),
+        _choice(ctx, i, state, ctx.pick(T_QUEUE, lang), [Option(q, d) for q, d in TICKET_QUEUES.items()],
+                queues.index(row["queue"])),
         _choice(ctx, i, state, ctx.pick(T_TTYPE, lang), [Option(t, d) for t, d in TTYPE_DESC.items()],
                 list(TTYPE_DESC).index(row["type"])),
         _score(ctx, i, state, ctx.pick(T_PRIORITY, lang), PRIORITY_LEVELS[lang],
