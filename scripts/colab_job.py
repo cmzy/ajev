@@ -162,7 +162,9 @@ def upload_file(session: str, local: str, remote: str, chunk_mb: int = 40) -> No
         k = 0
         while chunk := f.read(chunk_mb * 2**20):
             h.update(chunk)
-            part_local = os.path.join(tempfile.gettempdir(), f"upload.part{k:03d}")
+            # 每次上传用独立的临时文件名（两个上传同时进行时曾因共用 upload.partNNN 互相覆盖）
+            fd, part_local = tempfile.mkstemp(prefix=f"upload_{os.getpid()}_", suffix=f".part{k:03d}")
+            os.close(fd)
             with open(part_local, "wb") as out:
                 out.write(chunk)
             part_remote = f"{remote}.part{k:03d}"
@@ -207,7 +209,8 @@ def make_tar(paths: list[str], base: str, name: str) -> str:
     ``filter`` 参数是一个函数：对包里的每个文件调用一次，返回 None 表示“不要这个文件”，
     原样返回 ti 表示保留。这里用 lambda 写成一行。
     """
-    out = os.path.join(tempfile.gettempdir(), name)
+    # 每次打包放在独立的临时目录（两个上传同时进行时曾因共用同名压缩包互相覆盖、解压出错）
+    out = os.path.join(tempfile.mkdtemp(prefix="colab_job_"), name)
     with tarfile.open(out, "w:gz") as tar:
         for p in paths:
             tar.add(os.path.join(base, p), arcname=p,
