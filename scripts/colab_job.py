@@ -82,7 +82,7 @@ DRIVE_RUNS = "/content/drive/MyDrive/ajev/runs"
 CODE_PATHS = ["ajev", "scripts", "pyproject.toml", "README.md"]
 
 
-def colab(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def colab(*args: str, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
     """调用本地的 ``colab`` 命令行，并先打印出要执行的完整命令，方便排查。
 
     ``check=True`` 时命令返回非零退出码会抛出 ``CalledProcessError``；
@@ -92,12 +92,19 @@ def colab(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         → 先打印 "$ colab stop -s ajev"，再真正执行这条命令。
     ``*args`` 表示把任意多个位置参数收集成一个元组；``shlex.quote`` 会给含空格等特殊字符的参数加引号，
     这样打印出来的命令可以直接复制到终端里运行。
+    ``timeout``（秒）：超时就结束这条命令，返回退出码 124（与 shell 的 timeout 命令一致），而不是一直卡住。
     """
     print("$ colab " + " ".join(shlex.quote(a) for a in args), flush=True)
-    return subprocess.run(["colab", *args], check=check)
+    try:
+        return subprocess.run(["colab", *args], check=check, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[colab_job] command timed out after {timeout}s", flush=True)
+        if check:
+            raise
+        return subprocess.CompletedProcess(["colab", *args], 124)
 
 
-def remote_python(session: str, code: str, retries: int = 3) -> None:
+def remote_python(session: str, code: str, retries: int = 3, timeout: float = 600) -> None:
     """在 VM 的 Jupyter kernel 里执行一段 Python 代码。
 
     做法：把代码（先用 ``textwrap.dedent`` 去掉公共缩进）写进本地临时 .py 文件，
@@ -111,7 +118,8 @@ def remote_python(session: str, code: str, retries: int = 3) -> None:
 
     处理步骤：
         第 1 步：写临时文件（delete=False 让文件在 with 结束后仍保留，供 colab exec 读取）；
-        第 2 步：最多尝试 retries 次 colab exec，成功（退出码 0）就返回；
+        第 2 步：最多尝试 retries 次 colab exec，成功（退出码 0）就返回；每次最多等 ``timeout`` 秒
+                （连接偶尔会挂住不返回，没有超时就会一直等下去：曾经因此白等了半小时）；
         第 3 步：无论成功失败，finally 里都删除临时文件，不在本地留垃圾。
 
     举个例子：remote_python("ajev", "print(1 + 1)") → VM 上执行后，本地终端打印 2。
@@ -121,7 +129,7 @@ def remote_python(session: str, code: str, retries: int = 3) -> None:
         path = f.name
     try:
         for attempt in range(1, retries + 1):
-            r = colab("exec", "-s", session, "-f", path, check=False)
+            r = colab("exec", "-s", session, "-f", path, check=False, timeout=timeout)
             if r.returncode == 0:
                 return
             print(f"[colab_job] exec failed (attempt {attempt}/{retries})", flush=True)
@@ -137,8 +145,8 @@ def upload_file(session: str, local: str, remote: str, chunk_mb: int = 40) -> No
     为什么要分块：Colab 的上传接口对单个文件的大小有限制，约 100 MB 的数据包会直接返回 500 错误
     （第二版数据压缩后就有这么大）。做法：
         第 1 步：本地按 chunk_mb 切成若干块，逐块上传为 <remote>.part000、.part001……；
-        第 2 步：在 VM 上按顺序拼接成 <remote>，删除分块；
-        第 3 步：在 VM 上计算拼好的文件的 SHA-256，和本地的比较，不一致就报错。
+        第 2 步：在 VM 上按顺序拼接成 <remote>，计算 SHA-256 和本地的比较，一致后才删除分块；
+        第 3 步：这一步可以安全地重复执行（远程执行超时重试时）：分块已经删掉、但拼好的文件在且校验一致，就直接算成功。
     小于 chunk_mb 的文件直接整个上传。
     """
     import hashlib
@@ -163,17 +171,27 @@ def upload_file(session: str, local: str, remote: str, chunk_mb: int = 40) -> No
             k += 1
     remote_python(session, f"""
         import hashlib, os
-        parts = {parts!r}
-        h = hashlib.sha256()
-        with open({remote!r}, "wb") as out:
-            for p in parts:
-                data = open(p, "rb").read()
-                h.update(data)
-                out.write(data)
+        parts, remote, want = {parts!r}, {remote!r}, {h.hexdigest()!r}
+        if all(os.path.exists(p) for p in parts):
+            h = hashlib.sha256()
+            with open(remote, "wb") as out:
+                for p in parts:
+                    data = open(p, "rb").read()
+                    h.update(data)
+                    out.write(data)
+            ok = h.hexdigest() == want
+        else:  # 上一次尝试已经拼好并删除了分块：直接校验拼好的文件
+            h = hashlib.sha256()
+            with open(remote, "rb") as f:
+                for block in iter(lambda: f.read(1 << 24), b""):
+                    h.update(block)
+            ok = h.hexdigest() == want
+        if not ok:
+            raise SystemExit("SHA-256 mismatch after reassembling " + remote)
+        for p in parts:
+            if os.path.exists(p):
                 os.remove(p)
-        if h.hexdigest() != {h.hexdigest()!r}:
-            raise SystemExit("SHA-256 mismatch after reassembling {remote}")
-        print("reassembled", {remote!r}, os.path.getsize({remote!r}), "bytes, sha256 ok")
+        print("reassembled", remote, os.path.getsize(remote), "bytes, sha256 ok")
     """)
 
 
