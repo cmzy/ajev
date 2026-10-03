@@ -185,6 +185,12 @@ class Source:
             ds = load_dataset(self.path, data_files={key: self.data_files[key]}, split=base)
         else:
             ds = load_dataset(self.path, self.config, split=base)
+        # 图片列直接去掉：我们只用文字（例如 New Yorker 漫画用的是文字描述），也省得装图片解码库。
+        from datasets import Image
+
+        img = [c for c, f in ds.features.items() if isinstance(f, Image)]
+        if img:
+            ds = ds.remove_columns(img)
         if not part:
             return ds
         # "#train" / "#eval"：用固定种子打乱后切分（种子与 build 的 --seed 无关，保证训练和评测永远不重叠）。

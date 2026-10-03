@@ -12,7 +12,13 @@
    - When2Call 官方训练数据 train_pref 1,500 道（“两个候选回复该发哪个”，标准答案是官方标注的好回复）；
    - 程序生成的工具调用题 1,500 道（ajev/data/hard_gen.py 的 gen_tool：该调用工具 / 追问 / 直接回答 / 做不到，
      以及该用哪个工具；长材料版本工具列表超过 26 个，同时练习两字母编码）。
-   另外各留出一份组成工具类开发集 dev_tool.jsonl（只评测，不训练）。
+   另外各留出一份组成工具类开发集 dev_tool.jsonl（只评测，不训练）；
+5. **加强业务决策**（领域分析发现：客服、安全长材料为 0，中文推理几乎为 0，缺 HR、医疗分诊）：
+   中文为主（80%）的五类原有生成难题 2,000 道；长对话客服约 1,000、安全日志 1,000、HR 休假 800、急诊分诊 800；
+6. **补充排行榜各领域的训练数据**（ajev/data/bench_sources.py，只用排行榜不评测的部分）：
+   HellaSwag、WinoGrande、GSM8K、MMLU auxiliary_train、RAGTruth、ContractNLI、Humicroedit、NLI4CT、
+   iSarcasmEval、ACOS、New Yorker、ANLI r1/r2、钓鱼邮件，共约 1.4 万道；各数据源的评测部分各取 100 道
+   组成 dev_bench.jsonl（只评测，不训练）。
 
 其余（lm2 的 8,000 道难题、原有数据、开发集）不变；开发集 val / val_typed / dev_hard 原样复制。
 """
@@ -20,12 +26,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import shutil
 from collections import Counter
 
+from ajev.data.bench_sources import BENCH_QUOTAS, BENCH_SOURCES
 from ajev.data.hard_gen import generate
 from ajev.data.more_sources import MORE_SOURCES, TICKET_QUEUES
 from ajev.schema import Decision, Option, read_jsonl, write_jsonl
@@ -99,6 +107,36 @@ def main(argv: list[str] | None = None) -> None:
     dev_tool += generate(300, seed=a.seed + 1007, split="d", families=["tool"])
     write_jsonl(os.path.join(a.out, "dev_tool.jsonl"), dev_tool)
     print(f"[lm3] tool decisions: when2call_pref + gen_tool added; dev_tool {len(dev_tool)}")
+
+    # 第 5 步：加强业务决策（新的生成族 + 中文为主的原有五类难题）。
+    out += generate(2000, seed=a.seed + 21, split="z", zh_share=0.8)
+    for fam, n in (("chat", 667), ("seclog", 1000), ("hr", 800), ("triage", 800)):
+        out += generate(n, seed=a.seed + 31, split="t", zh_share=0.5, families=[fam])
+
+    # 第 6 步：排行榜各领域的训练数据（只用排行榜不评测的部分）。
+    dev_bench = []
+    for name, n in BENCH_QUOTAS.items():
+        src = BENCH_SOURCES[name]
+        got = list(src.iter_decisions(src.train_split, n, a.seed))
+        out += got
+        dev_bench += list(src.iter_decisions(src.eval_split, 100, a.seed))
+        print(f"[lm3] bench {name}: {len(got)}")
+    # 去重：材料 + 问题 + 选项名完全相同的题只留一道（原数据集里偶有重复文本）。
+    seen, uniq = set(), []
+    for d in out:
+        k = hashlib.sha1((d.state + "\0" + d.instructions + "\0" + "|".join(o.name for o in d.options)).encode()).hexdigest()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(d)
+    print(f"[lm3] removed {len(out) - len(uniq)} exact duplicates")
+    out = uniq
+    # 开发集里去掉材料与训练题相同的题（空材料除外，例如问答题的题目写在问题里、材料为空）。
+    train_states = {d.state for d in out if d.state.strip()}
+    dev_bench = [d for d in dev_bench if d.state not in train_states]
+    dev_tool = [d for d in dev_tool if d.state not in train_states]
+    write_jsonl(os.path.join(a.out, "dev_bench.jsonl"), dev_bench)
+    write_jsonl(os.path.join(a.out, "dev_tool.jsonl"), dev_tool)
+    print(f"[lm3] dev_bench {len(dev_bench)}, dev_tool {len(dev_tool)} after removing items whose state is in train")
 
     rng.shuffle(out)
     write_jsonl(os.path.join(a.out, "train.jsonl"), out)
