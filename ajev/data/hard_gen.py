@@ -67,6 +67,14 @@ def choice(id_: str, source: str, state: str, instr: str, options: list[tuple[st
                     target=[1.0 if n == gold else 0.0 for n, _ in options], lang=lang, group=group, meta={"gold": gold})
 
 
+def score(id_: str, source: str, state: str, instr: str, levels: list[str], gold: int, lang: str, group: str) -> Decision:
+    """打分题：levels 从低到高，gold 是正确等级的下标。"""
+    return Decision(id=id_, source=source, type="score", state=state, instructions=instr,
+                    options=[Option(str(k), d) for k, d in enumerate(levels)],
+                    target=[1.0 if k == gold else 0.0 for k in range(len(levels))], lang=lang, group=group,
+                    meta={"gold": str(gold)})
+
+
 def table(header: list[str], rows: list[list]) -> str:
     """Markdown 表格。"""
     out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
@@ -645,7 +653,255 @@ def gen_tool(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, 
 
 FAMILIES: dict[str, Callable] = {"refund": gen_refund, "invoice": gen_invoice, "contract": gen_contract,
                                  "approval": gen_approval, "sla": gen_sla}
-EXTRA_FAMILIES: dict[str, Callable] = {"tool": gen_tool}  # 不在默认列表里，保证 lm2 的生成结果可复现
+# ==== 7. 长对话客服工单（读完整段多轮对话：归哪个队列、要不要升级、客户情绪）==========================
+
+# 客服工单的 10 个团队队列（与 ajev/data/more_sources.py 的 TICKET_QUEUES 相同，这里复制一份避免循环导入）
+TICKET_QUEUES_FOR_GEN = {
+    "Technical Support": "Technical problems with the product or service: errors, bugs, configuration.",
+    "Product Support": "Questions about using product features or how a product works.",
+    "Customer Service": "General customer requests, complaints and account matters.",
+    "IT Support": "Internal IT issues: hardware, network, accounts and access.",
+    "Billing and Payments": "Invoices, charges, refunds and payment methods.",
+    "Returns and Exchanges": "Returning or exchanging purchased items.",
+    "Service Outages and Maintenance": "Service downtime, outages and planned maintenance.",
+    "Sales and Pre-Sales": "Pricing, quotes, demos and questions before buying.",
+    "General Inquiry": "Requests that do not fit any specific team.",
+    "Human Resources": "Employment, payroll, benefits and other HR matters.",
+}
+CHAT_ISSUES = {  # 问题类型 → (队列, 英文开场, 中文开场)
+    "delivery": ("Customer Service", "My order still hasn't arrived.", "我的订单到现在还没到。"),
+    "double_charge": ("Billing and Payments", "I was charged twice for the same order.", "同一个订单被扣了两次钱。"),
+    "damaged": ("Returns and Exchanges", "The blender I received is cracked.", "收到的搅拌机外壳裂了。"),
+    "lockout": ("IT Support", "I can't log in, my account says it's locked.", "我登不上账号，提示账号被锁定了。"),
+    "outage": ("Service Outages and Maintenance", "Your app has been down all morning.", "你们的应用一上午都打不开。"),
+    "how_to": ("Product Support", "How do I export my data to CSV?", "怎么把数据导出成 CSV？"),
+}
+ANGRY = {"en": ["This is ridiculous.", "I'm really fed up with this.", "Why does this keep happening?!",
+                "This is the worst service I've had.", "I've wasted hours on this."],
+         "zh": ["这也太离谱了。", "我真的受够了。", "怎么老是出这种问题？！", "这是我遇到过最差的服务。", "我在这上面浪费了好几个小时。"]}
+NEUTRAL_C = {"en": ["Sure, one moment.", "My email is the one on the account.", "OK.", "Yes, that's right.",
+                    "I'm checking now.", "Thanks."],
+             "zh": ["好的，稍等。", "邮箱就是账号上那个。", "嗯。", "对，没错。", "我看一下。", "谢谢。"]}
+NEUTRAL_A = {"en": ["Thanks for reaching out. Can you confirm your email?", "Let me look into that for you.",
+                    "Could you share your order number?", "I'm checking with the team now.",
+                    "Thanks for your patience.", "Is there anything else I can help with?"],
+             "zh": ["感谢联系我们，能确认一下邮箱吗？", "我帮您查一下。", "方便提供订单号吗？", "我正在和团队确认。",
+                    "感谢您的耐心等待。", "还有其他可以帮您的吗？"]}
+LEGAL = {"en": "If this isn't fixed today I'm filing a chargeback with my bank.", "zh": "今天再不解决我就向银行申请拒付。"}
+
+
+def gen_chat(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
+    zh = lang == "zh"
+    issue = rng.choice(list(CHAT_ISSUES))
+    queue, open_en, open_zh = CHAT_ISSUES[issue]
+    vip = rng.random() < 0.3
+    contacts = rng.choice([1, 1, 2, 3, 4])           # 这是第几次就同一问题联系
+    hours = rng.choice([4, 12, 30, 60, 90])          # 问题已经持续多少小时
+    legal = rng.random() < 0.2
+    n_angry = rng.choice([0, 0, 1, 2, 3, 4])
+    turns = [("customer", open_zh if zh else open_en)]
+    n_fill = rng.randrange(70, 140) if long else rng.randrange(3, 8)
+    for _ in range(n_fill):
+        turns.append(("agent", rng.choice(NEUTRAL_A[lang])))
+        turns.append(("customer", rng.choice(NEUTRAL_C[lang])))
+    # 生气的话、法律威胁插在对话后半段（必须读到后面才能发现）
+    late = len(turns) // 2
+    for _ in range(n_angry):
+        turns.insert(rng.randrange(late, len(turns) + 1), ("customer", rng.choice(ANGRY[lang])))
+    if legal:
+        turns.insert(rng.randrange(late, len(turns) + 1), ("customer", LEGAL[lang]))
+    escalate = legal or contacts >= 3 or (vip and hours > 48)
+    anger = min(3, n_angry + (1 if legal else 0))
+    who = {"customer": "客户" if zh else "Customer", "agent": "客服" if zh else "Agent"}
+    convo = "\n".join(f"{who[r]}: {t}" for r, t in turns)
+    if zh:
+        meta = f"客户等级：{'VIP' if vip else '普通'}；本问题已持续 {hours} 小时；这是客户第 {contacts} 次就此问题联系我们。"
+        rules = ("升级规则：客户提出拒付或法律行动；或同一问题第 3 次及以上联系；或 VIP 客户的问题持续超过 48 小时——"
+                 "满足任意一条就升级给主管。")
+        state = f"# 工单信息\n{meta}\n{rules}\n\n# 对话记录\n{convo}"
+        q1, q2, q3 = "这张工单应该分到哪个队列？", "按照升级规则，这张工单需要升级给主管。", "到对话结束时，客户的情绪激动程度是？"
+        levels = ["平静", "有些不满", "明显生气", "非常愤怒"]
+    else:
+        meta = (f"Customer tier: {'VIP' if vip else 'standard'}; issue open for {hours} hours; "
+                f"this is contact #{contacts} about this issue.")
+        rules = ("Escalation rule: escalate to a supervisor if the customer threatens a chargeback or legal action, "
+                 "or this is the 3rd or later contact about the same issue, or a VIP customer's issue has been open "
+                 "for more than 48 hours.")
+        state = f"# Ticket\n{meta}\n{rules}\n\n# Conversation\n{convo}"
+        q1, q2, q3 = ("Which queue should this ticket go to?", "Under the escalation rule, this ticket must be escalated.",
+                      "By the end of the conversation, how upset is the customer?")
+        levels = ["calm", "somewhat annoyed", "clearly angry", "furious"]
+    g = f"gen_chat/{uid}"
+    opts = [(q, d) for q, d in TICKET_QUEUES_FOR_GEN.items()]
+    return state, [choice(f"{g}/queue", "gen_chat", state, q1, opts, queue, lang, g),
+                   noul(f"{g}/escalate", "gen_chat", state, q2, escalate, lang, g),
+                   score(f"{g}/anger", "gen_chat", state, q3, levels, anger, lang, g)], str(escalate)
+
+
+# ==== 8. 安全日志（从大量登录日志里判断账号是否被盗、严重程度）====================================
+
+COUNTRIES = ["US", "DE", "BR", "IN", "NG", "RU", "VN", "CN", "GB", "FR"]
+
+
+def gen_seclog(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
+    zh = lang == "zh"
+    users = [f"user{rng.randrange(100, 999)}" for _ in range(rng.randrange(10, 20) if long else 4)]
+    target = rng.choice(users)
+    home = {u: rng.choice(COUNTRIES[:5]) for u in users}
+    t0 = dt.datetime(2026, 9, rng.randrange(1, 28), 0, 0)
+    events = []
+    for u in users:  # 正常活动：在本国的成功登录
+        for _ in range(rng.randrange(2, 6) if long else rng.randrange(1, 3)):
+            events.append((t0 + dt.timedelta(minutes=rng.randrange(0, 1440)), u, "login_success", home[u]))
+    # 目标账号的场景
+    pattern = rng.choice(["benign", "failed_only", "brute_then_success", "impossible_travel", "priv_esc"])
+    base = t0 + dt.timedelta(minutes=rng.randrange(60, 1200))
+    foreign = rng.choice([c for c in COUNTRIES if c != home[target]])
+    if pattern in ("failed_only", "brute_then_success", "priv_esc"):
+        for k in range(rng.randrange(5, 12)):
+            events.append((base + dt.timedelta(seconds=20 * k), target, "login_failed", foreign))
+    if pattern in ("brute_then_success", "priv_esc"):
+        events.append((base + dt.timedelta(minutes=5), target, "login_success", foreign))
+    if pattern == "priv_esc":
+        events.append((base + dt.timedelta(minutes=9), target, "role_changed_to_admin", foreign))
+    if pattern == "impossible_travel":
+        events.append((base, target, "login_success", home[target]))
+        events.append((base + dt.timedelta(minutes=rng.randrange(10, 50)), target, "login_success", foreign))
+    events.sort()
+    compromised = pattern in ("brute_then_success", "impossible_travel", "priv_esc")
+    severity = {"benign": 0, "failed_only": 1, "brute_then_success": 2, "impossible_travel": 2, "priv_esc": 3}[pattern]
+    log = "\n".join(f"{t:%Y-%m-%d %H:%M:%S} user={u} event={e} country={c}" for t, u, e, c in events)
+    if zh:
+        rules = ("判定规则：同一账号多次登录失败后、从异常国家登录成功，或 1 小时内在两个国家登录成功（不可能的移动），"
+                 "视为账号可能被盗；被盗后又获得管理员权限为最严重。仅有登录失败而没有成功登录为低风险。"
+                 f"各账号常用国家见账号表。")
+        acct = "\n".join(f"{u}: 常用国家 {home[u]}" for u in users)
+        state = f"# 规则\n{rules}\n\n# 账号表\n{acct}\n\n# 认证日志\n{log}"
+        q1, q2 = f"账号 {target} 很可能已经被盗用。", f"账号 {target} 相关事件的严重程度是？"
+        levels = ["无异常", "低", "中", "高"]
+    else:
+        rules = ("Rules: a successful login from an unusual country after repeated failed logins, or successful logins "
+                 "from two countries within one hour (impossible travel), means the account is likely compromised; "
+                 "gaining admin rights after that is the most severe case. Failed logins with no success are low risk. "
+                 "Each account's usual country is listed in the account table.")
+        acct = "\n".join(f"{u}: usual country {home[u]}" for u in users)
+        state = f"# Rules\n{rules}\n\n# Accounts\n{acct}\n\n# Authentication log\n{log}"
+        q1, q2 = f"Account {target} is likely compromised.", f"How severe are the events for account {target}?"
+        levels = ["none", "low", "medium", "high"]
+    g = f"gen_seclog/{uid}"
+    return state, [noul(f"{g}/compromised", "gen_seclog", state, q1, compromised, lang, g),
+                   score(f"{g}/severity", "gen_seclog", state, q2, levels, severity, lang, g)], pattern
+
+
+# ==== 9. HR 休假政策（政策 + 员工档案 + 申请 → 批准 / 需经理审批 / 拒绝）==============================
+
+def gen_hr(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
+    zh = lang == "zh"
+    notice_req = rng.choice([7, 14])
+    probation = 90
+    kind = rng.choice(["annual", "sick", "parental"])
+    tenure = rng.choice([30, 60, 120, 200, 400, 800])
+    days = rng.randrange(1, 12)
+    balance = rng.randrange(0, 20)
+    notice = rng.randrange(0, 30)
+    cert = rng.random() < 0.5
+    if kind == "annual":
+        if tenure < probation:
+            out = "reject"
+        elif balance < days:
+            out = "reject"
+        elif notice < notice_req:
+            out = "needs_manager"
+        else:
+            out = "approve"
+    elif kind == "sick":
+        out = "approve" if days <= 3 or cert else "reject"
+    else:
+        out = "approve" if tenure >= 365 else "reject"
+    direct = out == "approve"
+    names = [rng.choice(SURN_ZH) + rng.choice(NAMES_ZH) if zh else f"{rng.choice(NAMES_EN)} {rng.choice(SURN_EN)}"
+             for _ in range(rng.randrange(40, 120) if long else 5)]
+    who = names[0]
+    rows = []
+    for k, n in enumerate(names):
+        rows.append([n, tenure if k == 0 else rng.choice([30, 120, 400, 900]), balance if k == 0 else rng.randrange(0, 20)])
+    rng.shuffle(rows)
+    kz = {"annual": "年假", "sick": "病假", "parental": "育儿假"}
+    if zh:
+        rules = [f"入职未满 {probation} 天（试用期）的员工不能休年假。", "年假天数不能超过剩余年假余额。",
+                 f"年假需至少提前 {notice_req} 天申请，否则需要经理特批。", "病假超过 3 天须提供医院证明，否则不予批准。",
+                 "育儿假要求入职满 365 天。"] + filler(rng, lang, 6 if long else 1)
+        state = (f"# 休假制度\n{numbered(rules, lang)}\n\n# 员工档案\n{table(['姓名', '入职天数', '剩余年假'], rows)}\n\n"
+                 f"# 申请\n{who} 申请{kz[kind]} {days} 天，提前 {notice} 天提交"
+                 + ("，附有医院证明。" if kind == "sick" and cert else "。"))
+        q1, q2 = f"{who} 的这份休假申请应该如何处理？", f"按照制度，{who} 的这份申请不需要任何人特批，可以直接批准。"
+        opts = [("approve", "直接批准"), ("needs_manager", "需要经理特批"), ("reject", "不予批准")]
+    else:
+        rules = [f"Employees within their first {probation} days (probation) cannot take annual leave.",
+                 "Annual leave cannot exceed the remaining annual leave balance.",
+                 f"Annual leave must be requested at least {notice_req} days ahead, otherwise it needs manager approval.",
+                 "Sick leave longer than 3 days requires a doctor's note, otherwise it is not approved.",
+                 "Parental leave requires at least 365 days of service."] + filler(rng, lang, 6 if long else 1)
+        state = (f"# Leave policy\n{numbered(rules, lang)}\n\n# Employee records\n"
+                 f"{table(['name', 'days of service', 'annual leave balance'], rows)}\n\n# Request\n{who} requests "
+                 f"{days} days of {kind} leave, submitted {notice} days in advance"
+                 + (", with a doctor's note." if kind == "sick" and cert else "."))
+        q1, q2 = f"How should {who}'s leave request be handled?", f"Under the policy, {who}'s request can be approved directly without anyone's special approval."
+        opts = [("approve", "Approve"), ("needs_manager", "Needs manager approval"), ("reject", "Reject")]
+    g = f"gen_hr/{uid}"
+    return state, [choice(f"{g}/decision", "gen_hr", state, q1, opts, out, lang, g),
+                   noul(f"{g}/direct", "gen_hr", state, q2, direct, lang, g)], out
+
+
+# ==== 10. 急诊分诊（按分诊规则判断紧急程度；只判断就诊优先级，不做诊断）==============================
+
+def gen_triage(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
+    zh = lang == "zh"
+    pats = []
+    for _ in range(rng.randrange(20, 60) if long else 4):
+        pats.append({"id": f"P{rng.randrange(1000, 9999)}", "age": rng.choice([1, 8, 30, 45, 62, 80]),
+                     "spo2": rng.choice([86, 92, 95, 98]), "sbp": rng.choice([82, 105, 125, 160]),
+                     "temp": rng.choice([36.8, 38.2, 39.4]), "pain": rng.randrange(0, 11),
+                     "chest_pain": rng.random() < 0.15, "confused": rng.random() < 0.1})
+    p = rng.choice(pats)
+
+    def level(p) -> int:  # 1 = 立即，2 = 紧急，3 = 次紧急，4 = 非紧急
+        if p["spo2"] < 90 or p["sbp"] < 90 or p["confused"] or (p["chest_pain"] and p["age"] >= 40):
+            return 1
+        if (p["temp"] >= 39 and (p["age"] <= 1 or p["age"] >= 75)) or p["pain"] >= 8:
+            return 2
+        if p["temp"] >= 38 or p["pain"] >= 4:
+            return 3
+        return 4
+    lv = level(p)
+    yn = (lambda b: "是" if b else "否") if zh else (lambda b: "yes" if b else "no")
+    rows = [[x["id"], x["age"], x["spo2"], x["sbp"], x["temp"], x["pain"], yn(x["chest_pain"]), yn(x["confused"])] for x in pats]
+    if zh:
+        rules = ["一级（立即处置）：血氧低于 90%，或收缩压低于 90，或意识模糊，或 40 岁及以上伴胸痛。",
+                 "二级（紧急）：体温 ≥39℃ 且年龄 ≤1 岁或 ≥75 岁，或疼痛评分 ≥8。",
+                 "三级（次紧急）：体温 ≥38℃，或疼痛评分 ≥4。", "四级（非紧急）：其余情况。",
+                 "从一级开始逐级判断，满足即停止。本规则只用于确定就诊顺序，不是诊断。"] + filler(rng, lang, 4 if long else 0)
+        hdr = ["编号", "年龄", "血氧%", "收缩压", "体温", "疼痛评分", "胸痛", "意识模糊"]
+        state = f"# 分诊规则\n{numbered(rules, lang)}\n\n# 候诊患者\n{table(hdr, rows)}"
+        q1, q2 = f"患者 {p['id']} 的分诊级别是？", f"患者 {p['id']} 需要立即处置（一级）。"
+        levels = ["四级（非紧急）", "三级（次紧急）", "二级（紧急）", "一级（立即处置）"]
+    else:
+        rules = ["Level 1 (immediate): SpO2 below 90%, or systolic BP below 90, or confusion, or chest pain at age 40 or older.",
+                 "Level 2 (emergent): temperature ≥39°C with age ≤1 or ≥75, or pain score ≥8.",
+                 "Level 3 (urgent): temperature ≥38°C, or pain score ≥4.", "Level 4 (non-urgent): everything else.",
+                 "Check from level 1 downward and stop at the first match. These rules set the order of care; "
+                 "they are not a diagnosis."] + filler(rng, lang, 4 if long else 0)
+        hdr = ["id", "age", "SpO2 %", "systolic BP", "temp °C", "pain score", "chest pain", "confused"]
+        state = f"# Triage rules\n{numbered(rules, lang)}\n\n# Waiting patients\n{table(hdr, rows)}"
+        q1, q2 = f"What is patient {p['id']}'s triage level?", f"Patient {p['id']} needs immediate care (level 1)."
+        levels = ["Level 4 (non-urgent)", "Level 3 (urgent)", "Level 2 (emergent)", "Level 1 (immediate)"]
+    g = f"gen_triage/{uid}"
+    return state, [score(f"{g}/level", "gen_triage", state, q1, levels, 4 - lv, lang, g),
+                   noul(f"{g}/immediate", "gen_triage", state, q2, lv == 1, lang, g)], str(lv)
+
+
+EXTRA_FAMILIES: dict[str, Callable] = {"tool": gen_tool, "chat": gen_chat, "seclog": gen_seclog, "hr": gen_hr,
+                                       "triage": gen_triage}  # 不在默认列表里，保证 lm2 的生成结果可复现
 
 
 def generate(n_decisions: int, seed: int, zh_share: float = 0.35, long_share: float = 0.3,
@@ -658,7 +914,8 @@ def generate(n_decisions: int, seed: int, zh_share: float = 0.35, long_share: fl
     seen: set[int] = set()
     for fam, fn in fams.items():
         counts: Counter = Counter()
-        n_labels = {"refund": 3, "invoice": 4, "contract": 3, "approval": 4, "sla": 3, "tool": 4}[fam]
+        n_labels = {"refund": 3, "invoice": 4, "contract": 3, "approval": 4, "sla": 3, "tool": 4,
+                    "chat": 2, "seclog": 5, "hr": 3, "triage": 4}[fam]
         cap = per_family // n_labels + 1
         made, tries = 0, 0
         while made < per_family and tries < per_family * 200:

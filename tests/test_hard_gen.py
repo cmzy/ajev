@@ -32,3 +32,25 @@ def test_generate_valid_and_deterministic():
         d.validate()
         assert abs(sum(d.target) - 1) < 1e-9 and max(d.target) == 1.0
     assert len({d.id for d in a}) == len(a)
+
+
+def test_business_families_valid_and_balanced():
+    from collections import Counter
+    for fam in ("tool", "chat", "seclog", "hr", "triage"):
+        ds = generate(120, seed=4, families=[fam])
+        for d in ds:
+            d.validate()
+            assert max(d.target) == 1.0
+        assert len({d.id for d in ds}) == len(ds)
+        main = Counter(d.meta["gold"] for d in ds if d.id.split("/")[-1] in ("action", "escalate", "compromised", "decision", "level"))
+        assert len(main) >= 2  # 主问题的答案不是全部同一个
+
+
+def test_hr_and_triage_rules():
+    import random
+    from ajev.data.hard_gen import gen_hr, gen_triage
+    for s in range(30):
+        st, ds, out = gen_hr(random.Random(s), "en", False, "x")
+        assert (ds[1].meta["gold"] == "True") == (out == "approve")
+        st, ds, lv = gen_triage(random.Random(s), "en", False, "x")
+        assert (ds[1].meta["gold"] == "True") == (lv == "1")
