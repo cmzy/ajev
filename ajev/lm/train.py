@@ -42,7 +42,8 @@
 
 7. **梯度尖峰的处理与记录**：按步的平均材料长度把步分成 ``--spike-buckets`` 档（默认 4），裁剪前梯度范数超过
    **同档**最近 50 个正常步中位数的 ``--skip-gnorm-ratio`` 倍（默认 30），或超过绝对上限 ``--skip-gnorm``（默认 2000），
-   或是 NaN / inf，就跳过这一步的更新（分档的原因见 docs/skipped_lora4.md：梯度范数随材料长度增长）；同时把这一步涉及的题的
+   或是 NaN / inf，就跳过这一步的更新（分档的原因见 docs/skipped_lora4.md：梯度范数随材料长度增长）；
+   被跳过那一步的**全部题目**（题号、来源、损失）写进 ``{out}/skipped_items.jsonl``；同时把这一步涉及的题的
    来源分布、损失最大的 5 道题写进日志（``"skipped_update": true``），方便事后排查。
 
 8. **打分题的序数平滑**（``--ordinal-smoothing 0.2``）：只有一个评分者的打分类数据源（Feedback-Collection、
@@ -469,6 +470,14 @@ def main(argv: list[str] | None = None) -> None:
             if guard.should_skip(float(gnorm), mean_len):
                 skipped += 1
                 top = sorted(window_items, key=lambda x: -x[2])[:5]
+                # 被跳过这一步的每一道题都写进 skipped_items.jsonl（一行一道：步、梯度范数、档位、题号、来源、损失），
+                # 事后排查不用再按分批规则重建（gemma_lora4 时需要用 scripts/dump_skipped.py 重建）。
+                with open(os.path.join(args.out, "skipped_items.jsonl"), "a") as sf:
+                    for i, src, v in window_items:
+                        sf.write(json.dumps({"step": step, "gnorm": round(float(gnorm), 1),
+                                             "median_gnorm": round(median_before, 2) if median_before is not None else None,
+                                             "len_bucket": guard.bucket(mean_len), "id": i, "source": src,
+                                             "loss": round(v, 4)}) + "\n")
                 log({"skipped_update": True, "gnorm": round(float(gnorm), 1),
                      "median_gnorm": round(median_before, 2) if median_before is not None else None,
                      "len_bucket": guard.bucket(mean_len), "step_mean_tokens": round(mean_len),
