@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from typing import Any
 
@@ -148,12 +149,13 @@ T_PRIORITY = {
     "en": ["How urgent is this ticket?", "What priority should this ticket get?"],
     "zh": ["这张工单有多紧急？", "这张工单应该定为什么优先级？"],
 }
+# 优先级说明只描述“紧急程度”，不点名具体问题类型：数据审计发现原来的“高 = 安全问题……”与数据集的标注矛盾
+# （数据集里不少安全事件被标为中优先级）。
 PRIORITY_LEVELS = {
-    "en": ["Low: minor issue or general question; can wait.",
-           "Medium: noticeable impact on the customer; handle in the normal queue.",
-           "High: severe impact, outage, security or many users affected; handle immediately."],
-    "zh": ["低：小问题或一般咨询，可以等待。", "中：对客户有明显影响，按正常队列处理。",
-           "高：影响严重、服务中断、安全问题或大量用户受影响，需立即处理。"],
+    "en": ["Low: can wait; little impact on the customer.",
+           "Medium: noticeable impact; handle in the normal queue.",
+           "High: urgent; needs attention as soon as possible."],
+    "zh": ["低：可以等待，对客户影响不大。", "中：有明显影响，按正常队列处理。", "高：紧急，需要尽快处理。"],
 }
 PRIORITY_INDEX = {"low": 0, "medium": 1, "high": 2}
 
@@ -220,7 +222,11 @@ def conv_feedback(row: Row, i: int, ctx: Ctx) -> Decision | None:
     levels = [row[f"orig_score{k}_description"] for k in range(1, 6)]
     if not (1 <= score <= 5) or not all(levels) or not row.get("orig_criteria"):
         return None
-    state = state_to_text({"instruction": row["orig_instruction"], "response": row["orig_response"],
+    # 约 6% 的回答末尾混进了评分员的评语（"Feedback: ……"），等于泄露了分数：截掉（数据审计发现）。
+    response = re.split(r"\n\s*(?:###\s*)?Feedback\s*:", row["orig_response"])[0].strip()
+    if "Feedback:" in response:  # 评语以其他形式混在正文里的，直接丢弃
+        return None
+    state = state_to_text({"instruction": row["orig_instruction"], "response": response,
                            "reference_answer": row.get("orig_reference_answer") or ""})
     return _score(ctx, i, state, row["orig_criteria"], levels, one_hot(5, score - 1))
 
@@ -255,7 +261,9 @@ def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     head = int(limit * 0.7)
-    return text[:head] + "…" + text[len(text) - (limit - head - 1):]
+    tail = limit - head
+    # 明确标出省略了多少字（数据审计发现只用一个“…”时，读的人不知道中间少了内容，以为是原文）
+    return text[:head] + f" …[{len(text) - limit} chars omitted]… " + text[len(text) - tail:]
 
 
 def conv_helpsteer3(row: Row, i: int, ctx: Ctx) -> Decision | None:
@@ -288,7 +296,9 @@ def conv_helpsteer3(row: Row, i: int, ctx: Ctx) -> Decision | None:
     lang = "zh" if is_zh else ctx.instr_lang()
     # 字符预算：问题 + 两个回复合计约 700 个 token，给题型提示、问题和 7 个选项描述留出空间。
     cjk = row.get("language") in CJK_LANGS
-    user_limit, resp_limit, turn_limit = (250, 450, 150) if cjk else (800, 1200, 400)
+    # 字符预算：大模型路线（16K token 材料上限）放宽到每个回答约 4,000 字符；
+    # 最初的 1,200 字符是给 1,024 token 的 mmBERT 设的，数据审计发现 3/4 的回答被从中间截断。
+    user_limit, resp_limit, turn_limit = (600, 1500, 300) if cjk else (2000, 4000, 800)
     context = row.get("context") or []
     # 第 1 步：找出用户的最后一句话（对话最后一条一般就是用户发言）。
     last_user = next((m["content"] for m in reversed(context) if m.get("role") == "user"), "")
@@ -392,7 +402,11 @@ T_W2C_PREF = {
 
 
 def _w2c_tools(raw: list) -> list[dict]:
-    """工具定义（JSON 字符串列表）只保留名字、描述和参数名，避免材料太长。"""
+    """工具定义（JSON 字符串列表）→ 名字、描述、每个参数的类型和说明、必填参数。
+
+    When2Call 的工具大多没有单独的 required 字段，而是在参数类型里写 "str, optional" 表示选填，
+    其余参数都是必填——必填参数是判断“该调用工具还是该追问”的关键，不能丢（数据审计时发现最初的版本全部显示为空）。
+    """
     tools = []
     for t in raw or []:
         try:
@@ -400,9 +414,13 @@ def _w2c_tools(raw: list) -> list[dict]:
         except (TypeError, json.JSONDecodeError):
             continue
         params = spec.get("parameters") or {}
+        props = params.get("properties") or {}
+        required = params.get("required") or [k for k, v in props.items()
+                                              if "optional" not in str((v or {}).get("type", ""))]
         tools.append({"name": spec.get("name"), "description": spec.get("description"),
-                      "parameters": list((params.get("properties") or {}).keys()),
-                      "required": params.get("required") or []})
+                      "parameters": {k: f"{(v or {}).get('type', '')}: {_clip(str((v or {}).get('description', '')), 160)}"
+                                     for k, v in props.items()},
+                      "required": required})
     return tools
 
 

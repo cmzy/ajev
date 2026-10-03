@@ -279,8 +279,11 @@ def conv_newyorker(row: Row, i: int, ctx: Ctx) -> Decision | None:
 
 
 # ---- 12. 钓鱼邮件 --------------------------------------------------------------------------------
-T_PHISH = {"en": ["This email is a phishing attempt.", "This message is trying to phish the recipient."],
-           "zh": ["这封邮件是钓鱼邮件。", "这封邮件在试图骗取收件人的信息或钱财。"]}
+# 这个数据集标的是“垃圾 / 钓鱼邮件”对“正常邮件”（Phishing Email 里有大量广告垃圾邮件），所以问题这样写，
+# 而不是只说“钓鱼”（数据审计发现的措辞问题）。
+T_PHISH = {"en": ["This email is spam or a phishing attempt rather than a legitimate message.",
+                  "This message is unsolicited spam or phishing."],
+           "zh": ["这封邮件是垃圾邮件或钓鱼邮件，而不是正常邮件。", "这是一封不请自来的垃圾邮件或钓鱼邮件。"]}
 
 
 def conv_phishing(row: Row, i: int, ctx: Ctx) -> Decision | None:
@@ -300,8 +303,11 @@ BENCH_SOURCES: dict[str, Source] = {
         Source("hellaswag", "Rowan/hellaswag", None, "train#train", "train#eval", "en", conv_hellaswag),
         Source("winogrande", "allenai/winogrande", "winogrande_xl", "train#train", "train#eval", "en", conv_winogrande),
         Source("gsm8k", "openai/gsm8k", "main", "train#train", "train#eval", "en", conv_gsm8k),
-        Source("mmlu_aux", "cais/mmlu", "auxiliary_train", "train#train", "train#eval", "en", conv_mmlu_aux),
-        Source("ragtruth", "wandb/RAGTruth-processed", None, "train#train", "train#eval", "en", conv_ragtruth),
+        # 同一篇阅读材料配多道题 / 同一则新闻有多个模型的回答：按材料分组切分，训练和评测不共享材料。
+        Source("mmlu_aux", "cais/mmlu", "auxiliary_train", "train#train", "train#eval", "en", conv_mmlu_aux,
+               group_fn=lambda r: ((r.get("train") or r).get("question") or "")[:200]),
+        Source("ragtruth", "wandb/RAGTruth-processed", None, "train#train", "train#eval", "en", conv_ragtruth,
+               group_fn=lambda r: str(r.get("context") or "")[:500]),
         # 这个数据集用的是 datasets 已不再支持的加载脚本，所以直接读 Hugging Face 自动转换好的 parquet 文件。
         Source("contractnli", "parquet", None, "train", "validation", "en", conv_contractnli,
                data_files={sp: f"hf://datasets/kiddothe2b/contract-nli@refs%2Fconvert%2Fparquet/contractnli_b/{sp}/0000.parquet"

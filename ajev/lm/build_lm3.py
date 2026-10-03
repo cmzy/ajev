@@ -18,7 +18,12 @@
 6. **补充排行榜各领域的训练数据**（ajev/data/bench_sources.py，只用排行榜不评测的部分）：
    HellaSwag、WinoGrande、GSM8K、MMLU auxiliary_train、RAGTruth、ContractNLI、Humicroedit、NLI4CT、
    iSarcasmEval、ACOS、New Yorker、ANLI r1/r2、钓鱼邮件，共约 1.4 万道；各数据源的评测部分各取 100 道
-   组成 dev_bench.jsonl（只评测，不训练）。
+   组成 dev_bench.jsonl（只评测，不训练）；
+7. **数据审计后的修正**（docs/audit_lm3.md）：
+   - 用修好的转换器重新转换 HelpSteer3（回答不再被截到 1,200 字符）、Feedback-Collection（去掉混入的评分员评语）、
+     客服工单（优先级说明不再与标签矛盾），替换 lm2 里的旧版本；
+   - 用修好的生成器重新生成 lm2 带来的 4,500 道生成难题（干扰条款按领域、审批人必须高于申请人、写明边界等）；
+   - 最后去污染（ajev/data/decontam.py）：删掉与排行榜评测数据有文本重叠的训练题。
 
 其余（lm2 的 8,000 道难题、原有数据、开发集）不变；开发集 val / val_typed / dev_hard 原样复制。
 """
@@ -34,11 +39,14 @@ import shutil
 from collections import Counter
 
 from ajev.data.bench_sources import BENCH_QUOTAS, BENCH_SOURCES
+from ajev.data.decontam import contaminated, load_index
 from ajev.data.hard_gen import generate
 from ajev.data.more_sources import MORE_SOURCES, TICKET_QUEUES
 from ajev.schema import Decision, Option, read_jsonl, write_jsonl
 
 WIDE = {"banking77": 1000, "clinc150": 1000}
+# 审计后重新转换的数据源及题数（与 lm2 中的数量一致）
+RECONVERT = {"helpsteer3": 800, "feedback_collection": 800, "support_tickets": 1500}
 DROP_SOURCES = {"when2call"}
 
 
@@ -63,11 +71,11 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
 
-    # 第 1、2 步：lm2 去掉 When2Call，修正工单队列题。
+    # 第 1、2 步：lm2 去掉 When2Call；去掉需要重新转换 / 重新生成的旧版题（第 7 步补回）。
     out, dropped, fixed = [], Counter(), 0
     for d in read_jsonl(os.path.join(a.lm2, "train.jsonl")):
-        if d.source in DROP_SOURCES:
-            dropped[d.source] += 1
+        if d.source in DROP_SOURCES or d.source in RECONVERT or d.source.startswith("gen_"):
+            dropped[d.source.split("_")[0] if d.source.startswith("gen_") else d.source] += 1
             continue
         if d.source == "support_tickets" and d.id.endswith("/queue"):
             gold = d.options[d.gold_index].name
@@ -121,6 +129,21 @@ def main(argv: list[str] | None = None) -> None:
         out += got
         dev_bench += list(src.iter_decisions(src.eval_split, 100, a.seed))
         print(f"[lm3] bench {name}: {len(got)}")
+    # 第 7 步：重新转换审计发现有问题的数据源、用修好的生成器重新生成 lm2 的生成难题。
+    for name, n in RECONVERT.items():
+        src = MORE_SOURCES[name]
+        got = list(src.iter_decisions(src.train_split, n, a.seed))
+        out += got
+        print(f"[lm3] reconverted {name}: {len(got)}")
+    out += generate(4500, seed=a.seed + 1, split="t")
+
+    # 去污染：删掉与排行榜评测数据有文本重叠的训练题。
+    index = load_index(os.path.join(os.path.dirname(a.out) or ".", "decontam_index.json"))
+    bad = [d for d in out if contaminated(d, index)]
+    bad_ids = {d.id for d in bad}
+    out = [d for d in out if d.id not in bad_ids]
+    print(f"[lm3] decontam removed {len(bad)}: {dict(Counter(d.source for d in bad).most_common())}")
+
     # 去重：材料 + 问题 + 选项名完全相同的题只留一道（原数据集里偶有重复文本）。
     seen, uniq = set(), []
     for d in out:

@@ -173,6 +173,10 @@ class Source:
     data_files: dict[str, str] | None = None
     train_cap: int | None = None
     holdout: float = 0.1
+    # "#train" / "#eval" 切分时按什么分组：同一组（例如同一篇材料配的多道题）整组进训练或整组进评测，
+    # 否则同一篇材料会同时出现在训练和评测里（RAGTruth 同一则新闻有 6 个模型的回答，MMLU 辅助集同一篇阅读配多道题）。
+    # None = 按行随机切分。
+    group_fn: Callable[[dict], str] | None = None
 
     def load(self, split: str):
         """从 HF Hub（或本地缓存）加载指定 split。``datasets`` 延迟导入，避免只用 schema 时也要装它。"""
@@ -193,7 +197,17 @@ class Source:
             ds = ds.remove_columns(img)
         if not part:
             return ds
-        # "#train" / "#eval"：用固定种子打乱后切分（种子与 build 的 --seed 无关，保证训练和评测永远不重叠）。
+        # "#train" / "#eval"：按分组切分时，组名的哈希决定整组归属（与顺序无关、可复现）。
+        if self.group_fn is not None:
+            import hashlib
+
+            cut = int(self.holdout * 10000)
+            in_eval = lambda row: int(hashlib.sha1(self.group_fn(row).encode()).hexdigest(), 16) % 10000 < cut
+            ds = ds.filter(lambda row: in_eval(row) == (part == "eval"))
+            if part not in ("train", "eval"):
+                raise ValueError(f"unknown split part {part!r} in {split!r}")
+            return ds.shuffle(seed=12345)
+        # 否则用固定种子打乱后切分（种子与 build 的 --seed 无关，保证训练和评测永远不重叠）。
         ds = ds.shuffle(seed=12345)
         n_eval = int(len(ds) * self.holdout)
         if part == "eval":

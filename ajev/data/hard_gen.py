@@ -82,45 +82,99 @@ def table(header: list[str], rows: list[list]) -> str:
     return "\n".join(out)
 
 
-# ---- 通用干扰条款：和问题无关的政策段落，用来拉长材料、考验“找到相关规则”的能力 ----------------------
+# ---- 干扰条款：和问题无关的政策段落，用来拉长材料、考验“找到相关规则”的能力 ----------------------------
+# 按领域分开（数据审计发现：电商条款出现在 HR、医疗分诊规则里不合理），每条带自己合理的取值范围。
 FILLER = {
-    "en": [
-        "Gift cards are non-refundable and cannot be exchanged for cash except where required by law.",
-        "Price adjustments are available within {n} days of purchase if the same item is sold at a lower price by us.",
-        "Shipping fees are refunded only when the return is caused by our error, such as a wrong or defective item.",
-        "Orders shipped to PO boxes may take up to {n} additional business days.",
-        "Loyalty points earned on a purchase are deducted when that purchase is refunded.",
-        "Customers may request a copy of any invoice through the account portal for up to {n} months.",
-        "Data collected during the transaction is retained for {n} months in accordance with the privacy notice.",
-        "International orders may be subject to customs duties, which are the responsibility of the recipient.",
-        "Bulk orders of more than {n} units may qualify for a separate commercial agreement.",
-        "Promotional codes cannot be combined unless the promotion terms explicitly allow it.",
-        "Payment by bank transfer must be received within {n} days, otherwise the order is cancelled automatically.",
-        "Customer service is available by chat and email; phone support is limited to business accounts.",
-        "Items purchased from third-party sellers on the marketplace follow the seller's own policy.",
-        "Disputes not resolved within {n} days may be escalated to the regional consumer office.",
-    ],
-    "zh": [
-        "礼品卡不可退款，也不可兑换现金，法律另有规定的除外。",
-        "购买后 {n} 天内，如本店以更低价格出售同一商品，可申请价格补差。",
-        "仅当退货原因是我方错误（如发错货或商品有缺陷）时，才退还运费。",
-        "寄往邮政信箱的订单可能额外需要 {n} 个工作日。",
-        "订单退款时，该订单获得的积分将被扣回。",
-        "客户可在账户中心申请开具最近 {n} 个月内的任意发票。",
-        "交易过程中收集的数据按照隐私声明保存 {n} 个月。",
-        "跨境订单可能产生关税，由收件人承担。",
-        "一次采购超过 {n} 件的大宗订单可另行签订商业协议。",
-        "优惠码不可叠加使用，除非活动规则明确允许。",
-        "银行转账付款须在 {n} 天内到账，否则订单自动取消。",
-        "客服通过在线聊天和邮件提供服务，电话支持仅面向企业客户。",
-        "平台第三方卖家销售的商品适用卖家自己的售后政策。",
-        "{n} 天内未解决的争议可提交给地区消费者保护机构。",
-    ],
+    "retail": {
+        "en": [("Gift cards are non-refundable and cannot be exchanged for cash except where required by law.", None),
+               ("Price adjustments are available within {n} days of purchase if we sell the same item for less.", [7, 14, 30]),
+               ("Shipping fees are refunded only when the return is caused by our error, such as a wrong or defective item.", None),
+               ("Orders shipped to PO boxes may take up to {n} additional business days.", [2, 3, 5]),
+               ("Loyalty points earned on a purchase are deducted when that purchase is refunded.", None),
+               ("Customers may download any invoice from the account portal for up to {n} months.", [12, 24, 36]),
+               ("International orders may be subject to customs duties, which are the responsibility of the recipient.", None),
+               ("Bulk orders of more than {n} units may qualify for a separate commercial agreement.", [50, 100, 500]),
+               ("Promotional codes cannot be combined unless the promotion terms explicitly allow it.", None),
+               ("Items bought from third-party sellers on the marketplace follow the seller's own return policy.", None)],
+        "zh": [("礼品卡不可退款，也不可兑换现金，法律另有规定的除外。", None),
+               ("购买后 {n} 天内，如本店以更低价格出售同一商品，可申请价格补差。", [7, 14, 30]),
+               ("仅当退货原因是我方错误（如发错货或商品有缺陷）时，才退还运费。", None),
+               ("寄往偏远地区的订单可能额外需要 {n} 个工作日。", [2, 3, 5]),
+               ("订单退款时，该订单获得的积分将被扣回。", None),
+               ("客户可在账户中心下载最近 {n} 个月内的任意发票。", [12, 24, 36]),
+               ("跨境订单可能产生关税，由收件人承担。", None),
+               ("一次采购超过 {n} 件的大宗订单可另行签订商业协议。", [50, 100, 500]),
+               ("优惠码不可叠加使用，除非活动规则明确允许。", None),
+               ("平台第三方卖家销售的商品适用卖家自己的退货政策。", None)],
+    },
+    "finance": {
+        "en": [("Expense reports must be submitted within {n} days of the expense date.", [30, 60, 90]),
+               ("Receipts are required for any single item above {n} USD.", [25, 50, 75]),
+               ("Corporate cards must not be used for personal purchases.", None),
+               ("Per-diem meal allowances follow the published city rates.", None),
+               ("Vendors are paid on net-{n} terms unless otherwise agreed.", [30, 45, 60]),
+               ("Duplicate payments discovered later are recovered by credit note.", None),
+               ("Mileage is reimbursed at the current published rate.", None),
+               ("Approved purchase requests expire {n} days after approval.", [30, 60, 90])],
+        "zh": [("报销单须在费用发生后 {n} 天内提交。", [30, 60, 90]),
+               ("单笔超过 {n} 美元的费用须附发票。", [25, 50, 75]),
+               ("公司卡不得用于个人消费。", None),
+               ("出差餐补按公布的城市标准执行。", None),
+               ("供应商付款账期为 {n} 天，另有约定的除外。", [30, 45, 60]),
+               ("事后发现的重复付款通过红字发票冲回。", None),
+               ("自驾里程按当期公布的标准报销。", None),
+               ("已批准的采购申请自批准之日起 {n} 天内有效。", [30, 60, 90])],
+    },
+    "hr": {
+        "en": [("Employees must record working hours in the time system every week.", None),
+               ("Remote work requires a signed agreement with the line manager.", None),
+               ("Up to {n} unused annual leave days may be carried over to the next year.", [3, 5, 10]),
+               ("Overtime must be approved in advance.", None),
+               ("Employees receive {n} days of paid volunteering leave per year.", [1, 2, 3]),
+               ("HR records are kept for {n} years after employment ends.", [2, 3, 5]),
+               ("Training budget requests are reviewed every quarter.", None)],
+        "zh": [("员工须每周在考勤系统中登记工时。", None),
+               ("远程办公须与直属经理签署书面协议。", None),
+               ("未休年假最多可结转 {n} 天到下一年。", [3, 5, 10]),
+               ("加班须事先审批。", None),
+               ("员工每年享有 {n} 天带薪志愿者假。", [1, 2, 3]),
+               ("员工离职后人事档案保存 {n} 年。", [2, 3, 5]),
+               ("培训预算申请每季度集中审核一次。", None)],
+    },
+    "medical": {
+        "en": [("Patients who leave before being seen are recorded in the incident log.", None),
+               ("Interpreters can be requested at the registration desk.", None),
+               ("Each patient may have up to {n} companions in the waiting area.", [1, 2]),
+               ("Patients with respiratory symptoms must wear a mask.", None),
+               ("Current medications are recorded at registration.", None),
+               ("Waiting patients are re-assessed every {n} minutes.", [30, 60])],
+        "zh": [("未就诊即离开的患者须记入事件登记。", None),
+               ("可在挂号处申请翻译服务。", None),
+               ("每位患者在候诊区最多 {n} 名陪同人员。", [1, 2]),
+               ("有呼吸道症状的患者须佩戴口罩。", None),
+               ("挂号时须登记正在服用的药物。", None),
+               ("候诊患者每 {n} 分钟重新评估一次。", [30, 60])],
+    },
+    "it": {
+        "en": [("Resolution targets are tracked separately from first-response targets.", None),
+               ("Automatic acknowledgement emails do not count as a first response.", None),
+               ("Tickets close automatically after {n} days without a customer reply.", [5, 7, 14]),
+               ("Planned maintenance is announced at least {n} days in advance.", [2, 3, 7]),
+               ("Monthly SLA reports are sent to premium customers.", None),
+               ("Internal notes on a ticket are not visible to the customer.", None)],
+        "zh": [("解决时限与首次响应时限分别统计。", None),
+               ("系统自动发送的确认邮件不算首次响应。", None),
+               ("客户 {n} 天未回复的工单自动关闭。", [5, 7, 14]),
+               ("计划内维护至少提前 {n} 天通知。", [2, 3, 7]),
+               ("每月向高级客户发送 SLA 报告。", None),
+               ("工单的内部备注对客户不可见。", None)],
+    },
 }
 
 
-def filler(rng: random.Random, lang: str, k: int) -> list[str]:
-    return [s.format(n=rng.choice([3, 5, 7, 10, 14, 30, 60, 90, 180])) for s in rng.sample(FILLER[lang], min(k, len(FILLER[lang])))]
+def filler(rng: random.Random, lang: str, k: int, domain: str = "retail") -> list[str]:
+    pool = FILLER[domain][lang]
+    return [t.format(n=rng.choice(ch)) if ch else t for t, ch in rng.sample(pool, min(k, len(pool)))]
 
 
 def numbered(clauses: list[str], lang: str) -> str:
@@ -166,19 +220,19 @@ def gen_refund(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
 
     order_id = f"A{rng.randrange(100000, 999999)}"
     zh = lang == "zh"
-    rules = ([f"标准退货期限为签收后 {window} 天内。",
+    rules = ([f"标准退货期限为签收后 {window} 天内（按日历天计算，含第 {window} 天）。",
               f"金卡会员的退货期限在标准期限基础上延长 {ext} 天；银卡会员不享受延长。",
               "标记为“清仓”的商品属于最终销售，不接受退货退款。",
               f"已开封的数码电子商品可以退货，但需扣除商品价格 {fee}% 的重新上架费。",
               f"如果商品在签收时已破损，并在签收后 {dmg_days} 天内报告，无论是否清仓、是否超过退货期限，均可全额退款。"]
              if zh else
-             [f"Items may be returned within {window} days of delivery.",
+             [f"Items may be returned within {window} calendar days of delivery (day {window} is still within the window).",
               f"Gold members get an extra {ext} days on top of the standard return window; silver members do not.",
               "Items marked as clearance are final sale and cannot be returned for a refund.",
               f"Opened electronics may be returned, but a restocking fee of {fee}% of the item price is deducted.",
               f"Items that arrive damaged and are reported within {dmg_days} days of delivery receive a full refund, "
               "even if they are clearance items or the return window has passed."])
-    clauses = rules + filler(rng, lang, 9 if long else 3)
+    clauses = rules + filler(rng, lang, 9 if long else 3, "retail")
     rng.shuffle(clauses)
 
     def row(oid, c, cl, op, dlv, req, dmg, pr):
@@ -260,7 +314,7 @@ def gen_invoice(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[st
               f"If any line's unit price exceeds the PO unit price by more than {tol}%, hold the invoice for price "
               f"review; differences of {tol}% or less count as matching.",
               "Check the rules in this order and apply the first one that matches; approve invoices that pass all checks."])
-    clauses = rules + filler(rng, lang, 6 if long else 2)
+    clauses = rules + filler(rng, lang, 6 if long else 2, "finance")
     po_rows = [[s, q, f"{p:.2f}"] for s, q, p in po]
     rc_rows = [[s, received[s]] for s, _, _ in po]
     iv_rows = [[s, billed[s][0], f"{billed[s][1]:.2f}"] for s, _, _ in po]
@@ -291,19 +345,27 @@ def gen_invoice(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[st
 # ==== 3. 合同期限 =========================================================================================
 
 CONTRACT_FILLER = {
-    "en": ["Invoices are payable within {n} days of receipt.", "Either party may assign this agreement only with prior written consent.",
-           "Service credits of {n}% apply for each full hour of unplanned downtime beyond the monthly allowance.",
-           "Confidential information must be protected for {n} months after the agreement ends.",
-           "This agreement is governed by the laws of the State of Delaware.",
-           "The customer may audit the provider's security controls once every {n} months.",
-           "Fees increase by no more than {n}% at each renewal.", "Notices must be sent to the addresses listed in Schedule B.",
-           "Neither party is liable for delays caused by events beyond its reasonable control.",
-           "The provider maintains insurance coverage of at least {n} million dollars."],
-    "zh": ["发票应在收到后 {n} 天内支付。", "未经对方事先书面同意，任何一方不得转让本协议。",
-           "超出每月允许范围的计划外停机，每满一小时按 {n}% 给予服务抵扣。", "协议终止后，保密信息仍须保护 {n} 个月。",
-           "本协议适用中华人民共和国法律。", "客户每 {n} 个月可对服务商的安全控制进行一次审计。",
-           "每次续约时费用涨幅不超过 {n}%。", "通知应寄送至附件二所列地址。",
-           "因超出合理控制范围的事件造成的延误，双方均不承担责任。", "服务商应投保不低于 {n} 百万元的责任险。"],
+    "en": [("Invoices are payable within {n} days of receipt.", [30, 45, 60]),
+           ("Either party may assign this agreement only with prior written consent.", None),
+           ("A service credit of {n}% of the monthly fee applies for each full hour of unplanned downtime beyond the "
+            "monthly allowance.", [1, 2, 5]),
+           ("Confidential information must be protected for {n} months after the agreement ends.", [12, 24, 36]),
+           ("This agreement is governed by the laws of the State of Delaware.", None),
+           ("The customer may audit the provider's security controls once every {n} months.", [6, 12]),
+           ("Fees increase by no more than {n}% at each renewal.", [3, 5, 8]),
+           ("Notices must be sent to the addresses listed in Schedule B.", None),
+           ("Neither party is liable for delays caused by events beyond its reasonable control.", None),
+           ("The provider maintains liability insurance of at least {n} million dollars.", [1, 2, 5])],
+    "zh": [("发票应在收到后 {n} 天内支付。", [30, 45, 60]),
+           ("未经对方事先书面同意，任何一方不得转让本协议。", None),
+           ("超出每月允许范围的计划外停机，每满一小时按月费的 {n}% 给予服务抵扣。", [1, 2, 5]),
+           ("协议终止后，保密信息仍须保护 {n} 个月。", [12, 24, 36]),
+           ("本协议适用中华人民共和国法律。", None),
+           ("客户每 {n} 个月可对服务商的安全控制进行一次审计。", [6, 12]),
+           ("每次续约时费用涨幅不超过 {n}%。", [3, 5, 8]),
+           ("通知应寄送至附件二所列地址。", None),
+           ("因超出合理控制范围的事件造成的延误，双方均不承担责任。", None),
+           ("服务商应投保不低于 {n} 万元的责任险。", [500, 1000, 2000])],
 }
 
 
@@ -320,13 +382,15 @@ def gen_contract(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[s
     notice_date = None
     if rng.random() < 0.7:
         notice_date = start + dt.timedelta(days=rng.randrange(30, (init + renew * 2) * 30))
+    query = start + dt.timedelta(days=rng.randrange(30, (init + renew * 3) * 30))
     # 解约生效日：通知日所在期限的期末（若提前量足够），否则下一个期末
     term_effective = None
+    if notice_date and notice_date > query:
+        notice_date = None  # 查询日之后才发出的通知与“截至查询日的状态”无关，不写进记录也不参与计算
     if notice_date:
         k_days = amend[1] if amend and notice_date >= amend[0] else notice
         cur = next(e for e in ends if e > notice_date)
         term_effective = cur if (cur - notice_date).days >= k_days else ends[ends.index(cur) + 1]
-    query = start + dt.timedelta(days=rng.randrange(30, (init + renew * 3) * 30))
     if term_effective and query >= term_effective:
         status = "terminated"
     elif query < end0:
@@ -339,33 +403,36 @@ def gen_contract(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[s
     if zh:
         core = [f"本协议自 {f(start)} 起生效，初始期限为 {init} 个月。",
                 f"初始期限届满后，本协议自动续约，每次续约 {renew} 个月，除非一方在当期期限届满前至少 {notice} 天书面通知不再续约。",
-                "通知不足上述天数的，本协议在下一个期限届满时终止。"]
+                "通知不足上述天数的，本协议在下一个期限届满时终止；提前天数恰好等于要求的天数视为及时。",
+                "续约期自上一期限届满之日开始，即期限届满当天协议已进入新的期限。"]
         if amend:
             core.append(f"【修订一】自 {f(amend[0])} 起，上述不续约通知期改为 {amend[1]} 天，适用于该日期及之后发出的通知。")
     else:
         core = [f"This agreement takes effect on {f(start)} with an initial term of {init} months.",
                 f"After the initial term it renews automatically for successive {renew}-month terms unless either party gives "
                 f"written notice of non-renewal at least {notice} days before the end of the then-current term.",
-                "A notice given with less than the required period takes effect at the end of the following term."]
+                "A notice given with less than the required period takes effect at the end of the following term; "
+                "a notice given exactly the required number of days ahead is in time.",
+                "Each renewal term starts on the day the previous term ends, so on that day the agreement is already "
+                "in the new term."]
         if amend:
             core.append(f"[Amendment 1] For notices given on or after {f(amend[0])}, the non-renewal notice period is "
                         f"{amend[1]} days instead.")
     pool = CONTRACT_FILLER[lang]
-    extra = [s.format(n=rng.choice([5, 10, 12, 24, 30, 45])) for s in rng.sample(pool, 10 if long else 3)]
-    if long:
-        extra += filler(rng, lang, 14)
+    extra = [t.format(n=rng.choice(ch)) if ch else t for t, ch in rng.sample(pool, 10 if long else 3)]
     clauses = core + extra
     rng.shuffle(clauses)
     log = []
-    if notice_date:
+    if notice_date and notice_date <= query:
         log.append(f"{f(notice_date)}：客户发出书面不续约通知。" if zh else
                    f"{f(notice_date)}: The customer sent written notice of non-renewal.")
     noise = (["双方召开季度业务回顾会。", "服务商发送了年度安全审计报告。", "客户更新了开票联系人。", "双方确认了新的服务等级报告格式。"]
              if zh else ["Quarterly business review held.", "Provider sent the annual security audit report.",
                          "Customer updated its billing contact.", "Both parties agreed a new service report format."])
+    span = max(11, (query - start).days)  # 往来记录只写到查询日之前（审计发现过查询日之后的记录）
     for _ in range(rng.randrange(60, 130) if long else rng.randrange(2, 5)):
-        log.append(f"{f(start + dt.timedelta(days=rng.randrange(10, 1500)))}：{rng.choice(noise)}" if zh else
-                   f"{f(start + dt.timedelta(days=rng.randrange(10, 1500)))}: {rng.choice(noise)}")
+        day = f(start + dt.timedelta(days=rng.randrange(10, span)))
+        log.append(f"{day}：{rng.choice(noise)}" if zh else f"{day}: {rng.choice(noise)}")
     rng.shuffle(log)
     if zh:
         state = f"# 服务协议条款\n{numbered(clauses, lang)}\n\n# 往来记录\n" + "\n".join(log)
@@ -423,23 +490,27 @@ def gen_approval(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[s
     need = APPROVERS.index(base)
     if cat == "hospitality" and dept_region[dept] == hosp_region and usd > hosp_limit:
         need = max(need, APPROVERS.index("vp"))
-    if level in ("director", "vp"):
-        need = max(need, APPROVERS.index(level) + 1)  # director → 至少 vp；vp → cfo
+    if level != "staff":  # 审批人必须比申请人至少高一级：经理 → 至少总监，总监 → 至少副总裁，副总裁 → CFO
+        need = max(need, APPROVERS.index(level) + 1)
     approver = APPROVERS[min(need, 3)]
     over = usd > th[cat][1]
     lv = {"zh": {"staff": "员工", "manager": "经理", "director": "总监", "vp": "副总裁"}}.get(lang, {l: l for l in LEVELS})
-    ap = {"zh": {"manager": "经理", "director": "总监", "vp": "副总裁", "cfo": "首席财务官"}}.get(lang, {a: a.upper() if a == "cfo" else a for a in APPROVERS})
+    ap = {"zh": {"manager": "经理", "director": "总监", "vp": "副总裁", "cfo": "首席财务官"},
+          "en": {"manager": "Manager", "director": "Director", "vp": "VP", "cfo": "CFO"}}[lang]
+    dz = {"Finance": "财务部", "Sales": "销售部", "Legal": "法务部", "R&D": "研发部", "Ops": "运营部", "HR": "人力资源部",
+          "Marketing": "市场部", "IT": "信息技术部", "Support": "客服部", "Procurement": "采购部"}
+    dn = (lambda d: dz[d]) if zh else (lambda d: d)
     cz = {"travel": "差旅", "software": "软件", "equipment": "设备", "hospitality": "招待"}
     mat_rows = [[cz[c] if zh else c, f"≤ {th[c][0]:,}", f"≤ {th[c][1]:,}", f"≤ {th[c][2]:,}", f"> {th[c][2]:,}"] for c in cats]
     hdr_m = ["类别", "经理", "总监", "副总裁", "首席财务官"] if zh else ["category", "manager", "director", "VP", "CFO"]
-    emp_rows = [[p, d, lv[l]] for p, d, l in emps]
-    dep_rows = [[d, dept_region[d]] for d in depts]
+    emp_rows = [[p, dn(d), lv[l]] for p, d, l in emps]
+    dep_rows = [[dn(d), dept_region[d]] for d in depts]
     fx_rows = [[c, r] for c, r in fx.items()]
     if zh:
         rules = ["审批矩阵中的金额均为折算成美元后的金额，按汇率表折算。",
                  f"{hosp_region} 地区部门的招待费用，折算后超过 {hosp_limit:,} 美元的，至少需要副总裁审批。",
-                 "申请人职级为总监或副总裁的，审批人必须比申请人至少高一级（总监的申请至少由副总裁审批，副总裁的申请由首席财务官审批）。",
-                 "以上规则同时适用，取要求最高的审批级别。"] + filler(rng, lang, 6 if long else 1)
+                 "审批人必须比申请人至少高一级：经理的申请至少由总监审批，总监的申请至少由副总裁审批，副总裁的申请由首席财务官审批。",
+                 "以上规则同时适用，取要求最高的审批级别。"] + filler(rng, lang, 6 if long else 1, "finance")
         state = (f"# 费用审批制度\n{numbered(rules, lang)}\n\n# 审批矩阵（美元）\n{table(hdr_m, mat_rows)}\n\n"
                  f"# 汇率（1 单位外币 = ? 美元）\n{table(['币种', '汇率'], fx_rows)}\n\n# 部门\n{table(['部门', '地区'], dep_rows)}\n\n"
                  f"# 员工\n{table(['姓名', '部门', '职级'], emp_rows)}\n\n# 费用申请\n申请人：{who}；类别：{cz[cat]}；金额：{amount:,} {cur}")
@@ -449,9 +520,9 @@ def gen_approval(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[s
     else:
         rules = ["All amounts in the approval matrix are in USD after conversion with the FX table.",
                  f"Hospitality expenses from departments in {hosp_region} above {hosp_limit:,} USD need at least VP approval.",
-                 "If the requester is a director or VP, the approver must be at least one level above the requester "
-                 "(a director's request needs at least a VP; a VP's request needs the CFO).",
-                 "All rules apply together; use the highest approval level any rule requires."] + filler(rng, lang, 6 if long else 1)
+                 "The approver must be at least one level above the requester: a manager's request needs at least a "
+                 "director, a director's request needs at least a VP, and a VP's request needs the CFO.",
+                 "All rules apply together; use the highest approval level any rule requires."] + filler(rng, lang, 6 if long else 1, "finance")
         state = (f"# Expense approval policy\n{numbered(rules, lang)}\n\n# Approval matrix (USD)\n{table(hdr_m, mat_rows)}\n\n"
                  f"# FX rates (USD per unit)\n{table(['currency', 'rate'], fx_rows)}\n\n# Departments\n{table(['department', 'region'], dep_rows)}\n\n"
                  f"# Employees\n{table(['name', 'department', 'level'], emp_rows)}\n\n"
@@ -486,7 +557,8 @@ def gen_sla(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, l
     sla = {("standard", p): h for p, h in zip(pri, rng.choice([[2, 4, 8, 16], [1, 4, 9, 18], [2, 6, 12, 24]]))}
     sla.update({("premium", p): max(1, sla[("standard", p)] // 2) for p in pri})
     base = D(2026, 3, 2) + dt.timedelta(days=rng.randrange(0, 200))
-    holidays = {base + dt.timedelta(days=rng.randrange(0, 20)) for _ in range(2)}
+    weekdays = [base + dt.timedelta(days=k) for k in range(20) if (base + dt.timedelta(days=k)).weekday() < 5]
+    holidays = set(rng.sample(weekdays, 2))  # 节假日只取工作日（审计发现过落在周六的“节假日”）
     customers = [f"{'客户' if zh else 'Cust'}-{rng.randrange(100, 999)}" for _ in range(rng.randrange(30, 80) if long else 5)]
     tiers = {c: rng.choice(["standard", "premium"]) for c in customers}
     tickets = []
@@ -499,14 +571,15 @@ def gen_sla(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, l
     used = business_hours(created, reply, holidays)
     late = used - limit
     status = "met" if late <= 0 else ("breached_minor" if late <= 4 else "breached_major")
-    tf = lambda t: (f"{t.month}月{t.day}日 周{WEEKDAY_ZH[t.weekday()]} {t:%H:%M}" if zh else f"{t:%a %Y-%m-%d %H:%M}")
+    tf = lambda t: (f"{t.year}年{t.month}月{t.day}日 周{WEEKDAY_ZH[t.weekday()]} {t:%H:%M}" if zh else f"{t:%a %Y-%m-%d %H:%M}")
     sla_rows = [[q, sla[("standard", q)], sla[("premium", q)]] for q in pri]
     t_rows = [[t, c, q, tf(a), tf(b)] for t, c, q, a, b in tickets]
     c_rows = [[c, ("高级" if tiers[c] == "premium" else "标准") if zh else tiers[c]] for c in customers]
     hol = "、".join(fmt_date(h, lang) for h in sorted(holidays)) if zh else ", ".join(h.isoformat() for h in sorted(holidays))
     if zh:
         rules = ["首次响应时限按工作时间计算：周一至周五 9:00–18:00，法定节假日不计。工作时间以外创建的工单，从下一个工作时段开始计时。",
-                 "时限取决于工单优先级和客户等级，见 SLA 表（单位：工作小时）。", f"本期节假日：{hol}。"] + filler(rng, lang, 5 if long else 1)
+                 "时限取决于工单优先级和客户等级，见 SLA 表（单位：工作小时）；用时恰好等于时限也算满足。",
+                 f"本期节假日：{hol}。"] + filler(rng, lang, 5 if long else 1, "it")
         state = (f"# 客服 SLA 规则\n{numbered(rules, lang)}\n\n# SLA 表（首次响应，工作小时）\n{table(['优先级', '标准客户', '高级客户'], sla_rows)}\n\n"
                  f"# 客户等级\n{table(['客户', '等级'], c_rows)}\n\n# 工单\n{table(['工单号', '客户', '优先级', '创建时间', '首次回复时间'], t_rows)}")
         q1 = f"工单 {tid} 的首次响应是否满足 SLA？"
@@ -515,8 +588,9 @@ def gen_sla(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, l
     else:
         rules = ["First-response time is measured in business hours: Monday to Friday, 09:00–18:00, excluding public "
                  "holidays. Tickets created outside business hours start the clock at the next business period.",
-                 "The time limit depends on ticket priority and customer tier, as listed in the SLA table (business hours).",
-                 f"Public holidays this period: {hol}."] + filler(rng, lang, 5 if long else 1)
+                 "The time limit depends on ticket priority and customer tier, as listed in the SLA table (business "
+                 "hours); a response that uses exactly the limit still meets it.",
+                 f"Public holidays this period: {hol}."] + filler(rng, lang, 5 if long else 1, "it")
         state = (f"# Support SLA rules\n{numbered(rules, lang)}\n\n# SLA table (first response, business hours)\n"
                  f"{table(['priority', 'standard', 'premium'], sla_rows)}\n\n# Customer tiers\n{table(['customer', 'tier'], c_rows)}\n\n"
                  f"# Tickets\n{table(['ticket', 'customer', 'priority', 'created', 'first reply'], t_rows)}")
@@ -580,17 +654,29 @@ VALUES = {
     "title": {"en": ["Dentist", "Team sync"], "zh": ["看牙医", "团队周会"]},
     "start_time": {"en": ["Friday 3pm", "9am tomorrow"], "zh": ["周五下午3点", "明早9点"]},
 }
-# 缺失参数在请求里换成的含糊说法（按参数类型，读起来要自然）
-VAGUE = {
-    "en": {"city": "a city", "origin": "my city", "destination": "somewhere", "date": "some day", "time": "later",
-           "start_time": "sometime", "restaurant": "a restaurant", "party_size": "a few", "amount": "some money",
-           "from_currency": "my currency", "to_currency": "another currency", "tracking_number": "it",
-           "to": "someone", "subject": "something", "ticker": "that company", "order_id": "it",
-           "username": "my account", "title": "an appointment"},
-    "zh": {"city": "那边", "origin": "这里", "destination": "那边", "date": "改天", "time": "晚点",
-           "start_time": "某个时间", "restaurant": "一家餐厅", "party_size": "几", "amount": "一些",
-           "from_currency": "这边的钱", "to_currency": "另一种货币", "tracking_number": "那个", "to": "某人",
-           "subject": "某件事", "ticker": "那家公司", "order_id": "那个", "username": "我的账号", "title": "一个安排"},
+# 缺少某个必填参数时的自然说法：工具 → {缺少的参数: {语言: 模板}}（模板里只出现其余参数）。
+# 数据审计发现最初把“含糊词”塞进完整模板，产生 "Where is my parcel it right now?" 这类病句。
+ASK = {
+    "get_weather": {"city": {"en": "What will the weather be like on {date}?", "zh": "{date}天气怎么样？"},
+                    "date": {"en": "What's the weather going to be like in {city}?", "zh": "{city}的天气怎么样？"}},
+    "book_table": {"restaurant": {"en": "Book a table for {party_size} people at {time}.", "zh": "帮我订{time}的位子，{party_size}个人。"},
+                   "time": {"en": "Book a table at {restaurant} for {party_size} people.", "zh": "帮我在{restaurant}订个位子，{party_size}个人。"},
+                   "party_size": {"en": "Book a table at {restaurant} at {time}.", "zh": "帮我在{restaurant}订{time}的位子。"}},
+    "convert_currency": {"amount": {"en": "What's the exchange rate from {from_currency} to {to_currency}? I want to convert my savings.",
+                                    "zh": "我想把存的{from_currency}换成{to_currency}，帮我算一下能换多少。"},
+                         "from_currency": {"en": "How much is {amount} in {to_currency}?", "zh": "{amount}能换多少{to_currency}？"},
+                         "to_currency": {"en": "Convert {amount} {from_currency} for my trip.", "zh": "帮我把{amount}{from_currency}换算一下，出差用。"}},
+    "track_package": {"tracking_number": {"en": "Where is my parcel right now?", "zh": "我的快递现在到哪了？"}},
+    "send_email": {"to": {"en": "Send an email with the subject \"{subject}\".", "zh": "发封邮件，标题是“{subject}”。"},
+                   "subject": {"en": "Send an email to {to}.", "zh": "给{to}发封邮件。"}},
+    "search_flights": {"origin": {"en": "Find flights to {destination} on {date}.", "zh": "查一下{date}去{destination}的航班。"},
+                       "destination": {"en": "Find flights from {origin} on {date}.", "zh": "查一下{date}从{origin}出发的航班。"},
+                       "date": {"en": "Find flights from {origin} to {destination}.", "zh": "查一下从{origin}到{destination}的航班。"}},
+    "get_stock_price": {"ticker": {"en": "What is the stock trading at right now?", "zh": "这只股票现在多少钱？"}},
+    "check_order_status": {"order_id": {"en": "Has my order shipped yet?", "zh": "我的订单发货了吗？"}},
+    "reset_password": {"username": {"en": "I forgot my password, please reset it.", "zh": "我忘记密码了，帮我重置一下。"}},
+    "create_event": {"title": {"en": "Put something on my calendar at {start_time}.", "zh": "在日历上{start_time}加个日程。"},
+                     "start_time": {"en": "Put \"{title}\" on my calendar.", "zh": "在日历上加一个“{title}”。"}},
 }
 # 不需要工具、助手自己就能回答的请求，以及需要外部能力、但手头没有合适工具的请求。
 DIRECT = {"en": ["What is 15% of 80?", "Rewrite this more politely: send me the file now.",
@@ -622,10 +708,11 @@ def gen_tool(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, 
         shown = [target] + rng.sample(others, rng.randrange(2, len(others) + 1))
         desc_en, desc_zh, req, tmpl = TOOLS[target]
         vals = {k: rng.choice(VALUES[k][lang]) for k in req}
-        if action == "ask_for_info":  # 去掉一个必填参数：把它的值换成含糊的说法（助手必须追问）
+        if action == "ask_for_info":  # 缺一个必填参数：用专门写的、不含该参数的自然说法（助手必须追问）
             miss = rng.choice(req)
-            vals[miss] = VAGUE[lang][miss]
-        text = tmpl[lang].format(**vals)
+            text = ASK[target][miss][lang].format(**vals)
+        else:
+            text = tmpl[lang].format(**vals)
         gold_tool = target
     else:
         shown = rng.sample(names, rng.randrange(3, len(names) + 1))
@@ -668,71 +755,97 @@ TICKET_QUEUES_FOR_GEN = {
     "General Inquiry": "Requests that do not fit any specific team.",
     "Human Resources": "Employment, payroll, benefits and other HR matters.",
 }
-CHAT_ISSUES = {  # 问题类型 → (队列, 英文开场, 中文开场)
-    "delivery": ("Customer Service", "My order still hasn't arrived.", "我的订单到现在还没到。"),
-    "double_charge": ("Billing and Payments", "I was charged twice for the same order.", "同一个订单被扣了两次钱。"),
-    "damaged": ("Returns and Exchanges", "The blender I received is cracked.", "收到的搅拌机外壳裂了。"),
-    "lockout": ("IT Support", "I can't log in, my account says it's locked.", "我登不上账号，提示账号被锁定了。"),
-    "outage": ("Service Outages and Maintenance", "Your app has been down all morning.", "你们的应用一上午都打不开。"),
-    "how_to": ("Product Support", "How do I export my data to CSV?", "怎么把数据导出成 CSV？"),
+CHAT_ISSUES = {  # 问题类型 → (队列, 英文开场, 中文开场, 英文追问, 中文追问)
+    "delivery": ("Customer Service", "My order still hasn't arrived.", "我的订单到现在还没到。",
+                 "Could you share your order number?", "方便提供一下订单号吗？"),
+    "double_charge": ("Billing and Payments", "I was charged twice for the same order.", "同一个订单被扣了两次钱。",
+                      "Could you share the last four digits of the card?", "方便提供一下扣款银行卡的后四位吗？"),
+    "damaged": ("Returns and Exchanges", "The blender I received is cracked.", "收到的搅拌机外壳裂了。",
+                "Could you send a photo of the damage?", "方便拍一张破损的照片吗？"),
+    "lockout": ("Customer Service", "I can't log in, my account says it's locked.", "我登不上账号，提示账号被锁定了。",
+                "Could you confirm the email on the account?", "能确认一下账号绑定的邮箱吗？"),
+    "outage": ("Service Outages and Maintenance", "Your app has been down all morning.", "你们的应用一上午都打不开。",
+               "Which region are you connecting from?", "您是在哪个地区使用的？"),
+    "how_to": ("Product Support", "How do I export my data to CSV?", "怎么把数据导出成 CSV？",
+               "Which version of the app are you using?", "您用的是哪个版本的应用？"),
+    "bug": ("Technical Support", "The app crashes every time I upload a file.", "每次上传文件应用都会闪退。",
+            "Could you tell me the error code you see?", "能告诉我看到的错误代码吗？"),
+    "pricing": ("Sales and Pre-Sales", "I'd like a quote for 50 seats on the business plan.", "想咨询一下商业版 50 个席位的报价。",
+                "Could you share your company name?", "方便告诉我公司名称吗？"),
 }
+QUEUES_ZH = {"Technical Support": "产品或服务的技术问题：报错、故障、配置。", "Product Support": "功能使用、产品怎么用的问题。",
+             "Customer Service": "一般客户请求、投诉和账户事务。", "IT Support": "公司内部 IT 问题：硬件、网络、内部账号与权限。",
+             "Billing and Payments": "发票、扣款、退款和支付方式。", "Returns and Exchanges": "已购商品的退货或换货。",
+             "Service Outages and Maintenance": "服务中断、宕机和计划维护。", "Sales and Pre-Sales": "价格、报价、演示等购买前的问题。",
+             "General Inquiry": "不属于任何具体团队的请求。", "Human Resources": "雇佣、薪资、福利等人事问题。"}
 ANGRY = {"en": ["This is ridiculous.", "I'm really fed up with this.", "Why does this keep happening?!",
                 "This is the worst service I've had.", "I've wasted hours on this."],
          "zh": ["这也太离谱了。", "我真的受够了。", "怎么老是出这种问题？！", "这是我遇到过最差的服务。", "我在这上面浪费了好几个小时。"]}
-NEUTRAL_C = {"en": ["Sure, one moment.", "My email is the one on the account.", "OK.", "Yes, that's right.",
-                    "I'm checking now.", "Thanks."],
-             "zh": ["好的，稍等。", "邮箱就是账号上那个。", "嗯。", "对，没错。", "我看一下。", "谢谢。"]}
-NEUTRAL_A = {"en": ["Thanks for reaching out. Can you confirm your email?", "Let me look into that for you.",
-                    "Could you share your order number?", "I'm checking with the team now.",
-                    "Thanks for your patience.", "Is there anything else I can help with?"],
-             "zh": ["感谢联系我们，能确认一下邮箱吗？", "我帮您查一下。", "方便提供订单号吗？", "我正在和团队确认。",
-                    "感谢您的耐心等待。", "还有其他可以帮您的吗？"]}
+FILL = {"en": [("Thanks for your patience, I'm checking with the team now.", "OK, I'll wait."),
+               ("I've added a note to your case.", "Alright."),
+               ("Let me look into that for you.", "Sure."),
+               ("I'm still waiting for an update from the team.", "Please keep me posted."),
+               ("Thanks for the details.", "No problem.")],
+        "zh": [("感谢耐心等待，我正在和团队确认。", "好的，我等一下。"), ("我已经在工单里备注了。", "好。"),
+               ("我帮您查一下。", "嗯。"), ("还在等团队那边的回复。", "有进展告诉我。"), ("感谢提供这些信息。", "没事。")]}
 LEGAL = {"en": "If this isn't fixed today I'm filing a chargeback with my bank.", "zh": "今天再不解决我就向银行申请拒付。"}
 
 
 def gen_chat(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
     zh = lang == "zh"
     issue = rng.choice(list(CHAT_ISSUES))
-    queue, open_en, open_zh = CHAT_ISSUES[issue]
+    queue, open_en, open_zh, ask_en, ask_zh = CHAT_ISSUES[issue]
     vip = rng.random() < 0.3
     contacts = rng.choice([1, 1, 2, 3, 4])           # 这是第几次就同一问题联系
     hours = rng.choice([4, 12, 30, 60, 90])          # 问题已经持续多少小时
-    legal = rng.random() < 0.2
-    n_angry = rng.choice([0, 0, 1, 2, 3, 4])
-    turns = [("customer", open_zh if zh else open_en)]
-    n_fill = rng.randrange(70, 140) if long else rng.randrange(3, 8)
-    for _ in range(n_fill):
-        turns.append(("agent", rng.choice(NEUTRAL_A[lang])))
-        turns.append(("customer", rng.choice(NEUTRAL_C[lang])))
-    # 生气的话、法律威胁插在对话后半段（必须读到后面才能发现）
-    late = len(turns) // 2
-    for _ in range(n_angry):
-        turns.insert(rng.randrange(late, len(turns) + 1), ("customer", rng.choice(ANGRY[lang])))
-    if legal:
-        turns.insert(rng.randrange(late, len(turns) + 1), ("customer", LEGAL[lang]))
+    # 对话严格一问一答：客服、客户交替；客户的部分消息换成抱怨或拒付威胁
+    pairs = [("agent", ask_zh if zh else ask_en), ("customer", "好的，稍等。" if zh else "Sure, one moment.")]
+    for _ in range(rng.randrange(60, 120) if long else rng.randrange(3, 8)):
+        a, c = rng.choice(FILL[lang])
+        pairs += [("agent", a), ("customer", c)]
+    turns = [("customer", open_zh if zh else open_en)] + pairs
+    cust = [k for k, (r, _) in enumerate(turns) if r == "customer" and k > 0]
+    last10 = cust[-10:]
+    early = cust[:-10]
+    n_late, n_early = rng.choice([0, 0, 1, 2, 3]), rng.choice([0, 1, 2]) if early else 0
+    threat_late = rng.random() < 0.2
+    picks = rng.sample(last10, min(len(last10), n_late + int(threat_late)))
+    for k in picks[:n_late]:
+        turns[k] = ("customer", rng.choice(ANGRY[lang]))
+    if threat_late:
+        turns[picks[-1]] = ("customer", LEGAL[lang])
+    for k in rng.sample(early, min(len(early), n_early)):  # 更早的抱怨不计入情绪等级（考验只看最后 10 条）
+        turns[k] = ("customer", rng.choice(ANGRY[lang]))
+    legal = threat_late
+    n_angry = min(n_late, len(picks) - int(threat_late))
+    # 情绪等级规则（写在材料里）：只看客户最后 10 条消息
+    anger = 3 if legal and n_angry >= 1 else 2 if (legal or n_angry >= 2) else 1 if n_angry == 1 else 0
     escalate = legal or contacts >= 3 or (vip and hours > 48)
-    anger = min(3, n_angry + (1 if legal else 0))
     who = {"customer": "客户" if zh else "Customer", "agent": "客服" if zh else "Agent"}
     convo = "\n".join(f"{who[r]}: {t}" for r, t in turns)
     if zh:
         meta = f"客户等级：{'VIP' if vip else '普通'}；本问题已持续 {hours} 小时；这是客户第 {contacts} 次就此问题联系我们。"
-        rules = ("升级规则：客户提出拒付或法律行动；或同一问题第 3 次及以上联系；或 VIP 客户的问题持续超过 48 小时——"
-                 "满足任意一条就升级给主管。")
+        rules = ("升级规则：客户提出拒付或法律行动；或同一问题第 3 次及以上联系；或 VIP 客户的问题持续超过 48 小时——满足任意一条就升级给主管。\n"
+                 "情绪等级规则：只看客户的最后 10 条消息。没有抱怨为“平静”；1 条抱怨为“有些不满”；2 条及以上抱怨、或出现拒付 / 法律威胁为“明显生气”；"
+                 "拒付 / 法律威胁并且至少还有 1 条抱怨为“非常愤怒”。")
         state = f"# 工单信息\n{meta}\n{rules}\n\n# 对话记录\n{convo}"
-        q1, q2, q3 = "这张工单应该分到哪个队列？", "按照升级规则，这张工单需要升级给主管。", "到对话结束时，客户的情绪激动程度是？"
+        q1, q2, q3 = "这张工单应该分到哪个队列？", "按照升级规则，这张工单需要升级给主管。", "按照情绪等级规则，客户目前的情绪等级是？"
         levels = ["平静", "有些不满", "明显生气", "非常愤怒"]
+        opts = [(q, QUEUES_ZH[q]) for q in TICKET_QUEUES_FOR_GEN]
     else:
         meta = (f"Customer tier: {'VIP' if vip else 'standard'}; issue open for {hours} hours; "
                 f"this is contact #{contacts} about this issue.")
         rules = ("Escalation rule: escalate to a supervisor if the customer threatens a chargeback or legal action, "
                  "or this is the 3rd or later contact about the same issue, or a VIP customer's issue has been open "
-                 "for more than 48 hours.")
+                 "for more than 48 hours.\nMood rule: look only at the customer's last 10 messages. No complaints = calm; "
+                 "1 complaint = somewhat annoyed; 2 or more complaints, or a chargeback / legal threat = clearly angry; "
+                 "a chargeback / legal threat plus at least 1 complaint = furious.")
         state = f"# Ticket\n{meta}\n{rules}\n\n# Conversation\n{convo}"
         q1, q2, q3 = ("Which queue should this ticket go to?", "Under the escalation rule, this ticket must be escalated.",
-                      "By the end of the conversation, how upset is the customer?")
+                      "Under the mood rule, how upset is the customer now?")
         levels = ["calm", "somewhat annoyed", "clearly angry", "furious"]
+        opts = list(TICKET_QUEUES_FOR_GEN.items())
     g = f"gen_chat/{uid}"
-    opts = [(q, d) for q, d in TICKET_QUEUES_FOR_GEN.items()]
     return state, [choice(f"{g}/queue", "gen_chat", state, q1, opts, queue, lang, g),
                    noul(f"{g}/escalate", "gen_chat", state, q2, escalate, lang, g),
                    score(f"{g}/anger", "gen_chat", state, q3, levels, anger, lang, g)], str(escalate)
@@ -772,18 +885,21 @@ def gen_seclog(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
     severity = {"benign": 0, "failed_only": 1, "brute_then_success": 2, "impossible_travel": 2, "priv_esc": 3}[pattern]
     log = "\n".join(f"{t:%Y-%m-%d %H:%M:%S} user={u} event={e} country={c}" for t, u, e, c in events)
     if zh:
-        rules = ("判定规则：同一账号多次登录失败后、从异常国家登录成功，或 1 小时内在两个国家登录成功（不可能的移动），"
-                 "视为账号可能被盗；被盗后又获得管理员权限为最严重。仅有登录失败而没有成功登录为低风险。"
-                 f"各账号常用国家见账号表。")
+        rules = ("判定规则（各账号的常用国家见账号表，其他国家为异常国家）：\n"
+                 "- 账号可能被盗：在异常国家至少 5 次登录失败之后，又从该国家登录成功；或 1 小时内在两个不同国家都登录成功（不可能的移动）。\n"
+                 "- 严重程度：无异常 = 没有来自异常国家的登录记录；低 = 异常国家至少 5 次登录失败，但没有从该国家登录成功；"
+                 "中 = 账号可能被盗；高 = 账号可能被盗，并且随后获得了管理员权限。")
         acct = "\n".join(f"{u}: 常用国家 {home[u]}" for u in users)
         state = f"# 规则\n{rules}\n\n# 账号表\n{acct}\n\n# 认证日志\n{log}"
         q1, q2 = f"账号 {target} 很可能已经被盗用。", f"账号 {target} 相关事件的严重程度是？"
         levels = ["无异常", "低", "中", "高"]
     else:
-        rules = ("Rules: a successful login from an unusual country after repeated failed logins, or successful logins "
-                 "from two countries within one hour (impossible travel), means the account is likely compromised; "
-                 "gaining admin rights after that is the most severe case. Failed logins with no success are low risk. "
-                 "Each account's usual country is listed in the account table.")
+        rules = ("Rules (each account's usual country is in the account table; any other country is unusual):\n"
+                 "- Likely compromised: a successful login from an unusual country after at least 5 failed logins from "
+                 "that country, or successful logins from two different countries within one hour (impossible travel).\n"
+                 "- Severity: none = no logins from an unusual country; low = at least 5 failed logins from an unusual "
+                 "country but no successful login from it; medium = likely compromised; high = likely compromised and "
+                 "then granted admin rights.")
         acct = "\n".join(f"{u}: usual country {home[u]}" for u in users)
         state = f"# Rules\n{rules}\n\n# Accounts\n{acct}\n\n# Authentication log\n{log}"
         q1, q2 = f"Account {target} is likely compromised.", f"How severe are the events for account {target}?"
@@ -795,12 +911,15 @@ def gen_seclog(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
 
 # ==== 9. HR 休假政策（政策 + 员工档案 + 申请 → 批准 / 需经理审批 / 拒绝）==============================
 
+TENURES = [30, 60, 120, 200, 400, 800]
+
+
 def gen_hr(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, list[Decision], str]:
     zh = lang == "zh"
     notice_req = rng.choice([7, 14])
     probation = 90
     kind = rng.choice(["annual", "sick", "parental"])
-    tenure = rng.choice([30, 60, 120, 200, 400, 800])
+    tenure = rng.choice(TENURES)
     days = rng.randrange(1, 12)
     balance = rng.randrange(0, 20)
     notice = rng.randrange(0, 30)
@@ -819,18 +938,19 @@ def gen_hr(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, li
     else:
         out = "approve" if tenure >= 365 else "reject"
     direct = out == "approve"
-    names = [rng.choice(SURN_ZH) + rng.choice(NAMES_ZH) if zh else f"{rng.choice(NAMES_EN)} {rng.choice(SURN_EN)}"
-             for _ in range(rng.randrange(40, 120) if long else 5)]
+    pool = ([a + b + c for a in SURN_ZH for b in NAMES_ZH for c in NAMES_ZH] if zh else
+            [f"{a} {b}" for a in NAMES_EN for b in SURN_EN])
+    names = rng.sample(pool, rng.randrange(40, 120) if long else 5)  # 不重复（审计发现过同名员工导致答案取决于看哪一行）
     who = names[0]
     rows = []
-    for k, n in enumerate(names):
-        rows.append([n, tenure if k == 0 else rng.choice([30, 120, 400, 900]), balance if k == 0 else rng.randrange(0, 20)])
+    for k, n in enumerate(names):  # 所有员工的入职天数取值范围相同，避免靠取值认出申请人
+        rows.append([n, tenure if k == 0 else rng.choice(TENURES), balance if k == 0 else rng.randrange(0, 20)])
     rng.shuffle(rows)
     kz = {"annual": "年假", "sick": "病假", "parental": "育儿假"}
     if zh:
         rules = [f"入职未满 {probation} 天（试用期）的员工不能休年假。", "年假天数不能超过剩余年假余额。",
                  f"年假需至少提前 {notice_req} 天申请，否则需要经理特批。", "病假超过 3 天须提供医院证明，否则不予批准。",
-                 "育儿假要求入职满 365 天。"] + filler(rng, lang, 6 if long else 1)
+                 "育儿假要求入职满 365 天。"] + filler(rng, lang, 6 if long else 1, "hr")
         state = (f"# 休假制度\n{numbered(rules, lang)}\n\n# 员工档案\n{table(['姓名', '入职天数', '剩余年假'], rows)}\n\n"
                  f"# 申请\n{who} 申请{kz[kind]} {days} 天，提前 {notice} 天提交"
                  + ("，附有医院证明。" if kind == "sick" and cert else "。"))
@@ -841,10 +961,10 @@ def gen_hr(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str, li
                  "Annual leave cannot exceed the remaining annual leave balance.",
                  f"Annual leave must be requested at least {notice_req} days ahead, otherwise it needs manager approval.",
                  "Sick leave longer than 3 days requires a doctor's note, otherwise it is not approved.",
-                 "Parental leave requires at least 365 days of service."] + filler(rng, lang, 6 if long else 1)
+                 "Parental leave requires at least 365 days of service."] + filler(rng, lang, 6 if long else 1, "hr")
         state = (f"# Leave policy\n{numbered(rules, lang)}\n\n# Employee records\n"
                  f"{table(['name', 'days of service', 'annual leave balance'], rows)}\n\n# Request\n{who} requests "
-                 f"{days} days of {kind} leave, submitted {notice} days in advance"
+                 f"{days} day{'s' if days != 1 else ''} of {kind} leave, submitted {notice} day{'s' if notice != 1 else ''} in advance"
                  + (", with a doctor's note." if kind == "sick" and cert else "."))
         q1, q2 = f"How should {who}'s leave request be handled?", f"Under the policy, {who}'s request can be approved directly without anyone's special approval."
         opts = [("approve", "Approve"), ("needs_manager", "Needs manager approval"), ("reject", "Reject")]
@@ -859,7 +979,7 @@ def gen_triage(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
     zh = lang == "zh"
     pats = []
     for _ in range(rng.randrange(20, 60) if long else 4):
-        pats.append({"id": f"P{rng.randrange(1000, 9999)}", "age": rng.choice([1, 8, 30, 45, 62, 80]),
+        pats.append({"id": f"P{rng.randrange(1000, 9999)}", "age": rng.choice([18, 30, 45, 62, 76, 85]),
                      "spo2": rng.choice([86, 92, 95, 98]), "sbp": rng.choice([82, 105, 125, 160]),
                      "temp": rng.choice([36.8, 38.2, 39.4]), "pain": rng.randrange(0, 11),
                      "chest_pain": rng.random() < 0.15, "confused": rng.random() < 0.1})
@@ -868,7 +988,7 @@ def gen_triage(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
     def level(p) -> int:  # 1 = 立即，2 = 紧急，3 = 次紧急，4 = 非紧急
         if p["spo2"] < 90 or p["sbp"] < 90 or p["confused"] or (p["chest_pain"] and p["age"] >= 40):
             return 1
-        if (p["temp"] >= 39 and (p["age"] <= 1 or p["age"] >= 75)) or p["pain"] >= 8:
+        if (p["temp"] >= 39 and p["age"] >= 75) or p["pain"] >= 8:
             return 2
         if p["temp"] >= 38 or p["pain"] >= 4:
             return 3
@@ -878,19 +998,19 @@ def gen_triage(rng: random.Random, lang: str, long: bool, uid: str) -> tuple[str
     rows = [[x["id"], x["age"], x["spo2"], x["sbp"], x["temp"], x["pain"], yn(x["chest_pain"]), yn(x["confused"])] for x in pats]
     if zh:
         rules = ["一级（立即处置）：血氧低于 90%，或收缩压低于 90，或意识模糊，或 40 岁及以上伴胸痛。",
-                 "二级（紧急）：体温 ≥39℃ 且年龄 ≤1 岁或 ≥75 岁，或疼痛评分 ≥8。",
+                 "二级（紧急）：体温 ≥39℃ 且年龄 ≥75 岁，或疼痛评分 ≥8。",
                  "三级（次紧急）：体温 ≥38℃，或疼痛评分 ≥4。", "四级（非紧急）：其余情况。",
-                 "从一级开始逐级判断，满足即停止。本规则只用于确定就诊顺序，不是诊断。"] + filler(rng, lang, 4 if long else 0)
+                 "从一级开始逐级判断，满足即停止。本规则只用于成年患者确定就诊顺序，不是诊断。"] + filler(rng, lang, 4 if long else 0, "medical")
         hdr = ["编号", "年龄", "血氧%", "收缩压", "体温", "疼痛评分", "胸痛", "意识模糊"]
         state = f"# 分诊规则\n{numbered(rules, lang)}\n\n# 候诊患者\n{table(hdr, rows)}"
         q1, q2 = f"患者 {p['id']} 的分诊级别是？", f"患者 {p['id']} 需要立即处置（一级）。"
         levels = ["四级（非紧急）", "三级（次紧急）", "二级（紧急）", "一级（立即处置）"]
     else:
         rules = ["Level 1 (immediate): SpO2 below 90%, or systolic BP below 90, or confusion, or chest pain at age 40 or older.",
-                 "Level 2 (emergent): temperature ≥39°C with age ≤1 or ≥75, or pain score ≥8.",
+                 "Level 2 (emergent): temperature ≥39°C at age 75 or older, or pain score ≥8.",
                  "Level 3 (urgent): temperature ≥38°C, or pain score ≥4.", "Level 4 (non-urgent): everything else.",
                  "Check from level 1 downward and stop at the first match. These rules set the order of care; "
-                 "they are not a diagnosis."] + filler(rng, lang, 4 if long else 0)
+                 "they are not a diagnosis, and apply to adult patients only."] + filler(rng, lang, 4 if long else 0, "medical")
         hdr = ["id", "age", "SpO2 %", "systolic BP", "temp °C", "pain score", "chest pain", "confused"]
         state = f"# Triage rules\n{numbered(rules, lang)}\n\n# Waiting patients\n{table(hdr, rows)}"
         q1, q2 = f"What is patient {p['id']}'s triage level?", f"Patient {p['id']} needs immediate care (level 1)."
