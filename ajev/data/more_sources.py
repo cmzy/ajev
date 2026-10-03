@@ -253,10 +253,11 @@ CJK_LANGS = {"chinese", "japanese", "korean"}
 
 
 def _clip(text: str, limit: int) -> str:
-    """把过长的文本截到 ``limit`` 个字符以内：保留开头约 70% 和结尾约 30%，中间用“…”省略。
+    """把过长的文本截到 ``limit`` 个原文字符：保留开头约 70% 和结尾约 30%，中间标明省略了多少字。
 
     为什么保留结尾：回复的结论、代码的最后部分、对话最后的要求往往在末尾，只保留开头会丢掉这些。
-    例如 limit=10，"abcdefghijklmnopqrstuvwxyz" → "abcdefg…yz"（开头 7 个 + “…” 1 个 + 结尾 2 个 = 正好 10 个）。
+    例如 limit=10，"abcdefghijklmnopqrstuvwxyz" → "abcdefg …[16 chars omitted]… xyz"
+    （保留开头 7 个、结尾 3 个原文字符，中间标明省略了 16 个字符）。
     """
     if len(text) <= limit:
         return text

@@ -126,8 +126,8 @@ def test_ultrafeedback_zh_score():
 
 
 def test_clip_keeps_head_and_tail():
-    """_clip 保留开头约 70% 和结尾约 30%，中间用“…”省略，总长度正好等于上限；不超长的文本原样返回。"""
-    assert ms._clip("abcdefghijklmnopqrstuvwxyz", 10) == "abcdefg…yz"
+    """_clip 保留开头约 70% 和结尾约 30% 的原文（共 limit 个字符），中间标明省略了多少字；不超长的文本原样返回。"""
+    assert ms._clip("abcdefghijklmnopqrstuvwxyz", 10) == "abcdefg …[16 chars omitted]… xyz"
     assert ms._clip("short", 10) == "short"
 
 
@@ -140,7 +140,7 @@ def test_helpsteer3_state_puts_key_parts_first():
     s = json.loads(d.state)
     assert list(s) == ["last_user_turn", "response_1", "response_2", "earlier_conversation"]
     assert s["last_user_turn"] == "turn 8"
-    assert len(s["response_1"]) == 1200 and s["response_2"] == "y"
+    assert s["response_1"].count("x") == 4000 and "chars omitted" in s["response_1"] and s["response_2"] == "y"
     assert [m["content"] for m in s["earlier_conversation"]] == ["turn 4", "turn 5", "turn 6", "turn 7"]
 
 
