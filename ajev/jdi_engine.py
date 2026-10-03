@@ -16,34 +16,12 @@
 
 from __future__ import annotations
 
-import re
+from decision_index.engines.base import Engine, Unsupported
 
-from decision_index.engines.base import Engine, Unsupported, text
-
+from ajev.jev_request import detect_lang, plain_questions
 from ajev.schema import NOUL_TRUE, decisions_from_jev
 
-CJK = re.compile(r"[一-鿿]")
 NO_TRUNCATION = 10 ** 9
-
-
-def _lang(state, questions) -> str:
-    """材料和问题里中文字符占比超过 10% 就按中文题处理（只影响是非题的默认选项说明）。"""
-    s = text(state) + "".join(text(q.get("instructions", "")) for q in questions.values())
-    return "zh" if s and len(CJK.findall(s)) / len(s) > 0.1 else "en"
-
-
-def _plain(questions: dict) -> dict:
-    """把问题里的 instructions / 选项说明统一转成字符串（排行榜允许它们是 JSON 对象）。"""
-    out = {}
-    for k, q in questions.items():
-        q = dict(q)
-        q["instructions"] = text(q.get("instructions", ""))
-        if q["type"] == "choice":
-            q["criteria"] = {name: "" if desc is None else text(desc) for name, desc in q["criteria"].items()}
-        elif q.get("criteria"):
-            q["criteria"] = {name: text(desc) for name, desc in q["criteria"].items()}
-        out[k] = q
-    return out
 
 
 class AJevEngine(Engine):
@@ -90,7 +68,7 @@ class AJevEngine(Engine):
         for k, q in questions.items():
             if q["type"] not in ("choice", "noul"):
                 raise Unsupported(f"question {k}: unsupported type {q['type']}")
-        ds = decisions_from_jev(state, _plain(questions), lang=_lang(state, questions))
+        ds = decisions_from_jev(state, plain_questions(questions), lang=detect_lang(state, questions))
         lengths = [len(self.prompt_ids(self.p.tok, d, NO_TRUNCATION)) for d in ds]
         if max(lengths) > self.limit:
             raise Unsupported(f"prompt of {max(lengths)} tokens exceeds the {self.limit}-token context")
